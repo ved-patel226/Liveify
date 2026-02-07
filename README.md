@@ -36,18 +36,17 @@ A deep learning model that transforms studio audio into live, performance audio.
 - Python 3.9+
 - CUDA 11.8+ (optional, for GPU acceleration)
 
-### Setup
+### Setup# Clone repository
 
 ```bash
-# Clone repository
-cd /mnt/Fedora2/code/Liveify
+rcd /mnt/Fedora2/code/Liveify
 
 # Create virtual environment
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Install dependencies
-pip install torch pytorch-lightning librosa whisper scikit-learn numpy scipy tqdm
+pip install -r requirements.txt
 pip install tensorboard torchinfo  # For training utilities
 ```
 
