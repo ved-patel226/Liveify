@@ -153,7 +153,12 @@ def train(args):
     model = LiveifyModel(
         input_sr=int(args.sample_rate * args.segment_duration),
         output_sr=int(args.sample_rate * args.segment_duration),
-        hidden_channels=args.hidden_channels,
+        hidden_channels=128,
+        encoder_strides=[8, 4, 4],
+        transformer_dim=(512 + 256) // 2,
+        num_heads=8,
+        num_layers=4,
+        lr=args.learning_rate,
     )
 
     lightning_module = LiveifyLightningModule(
@@ -168,10 +173,10 @@ def train(args):
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_dir,
-        filename="liveify-{epoch:02d}-{val/loss:.4f}",
+        filename="best",
         monitor="val/loss",
         mode="min",
-        save_top_k=3,
+        save_top_k=1,
         save_last=True,
     )
 
@@ -200,10 +205,13 @@ def train(args):
     )
 
     print("\n" + "=" * 50)
-    print("Starting training...")
+    if args.resume_from:
+        print(f"Resuming training from: {args.resume_from}")
+    else:
+        print("Starting training...")
     print("=" * 50 + "\n")
 
-    trainer.fit(lightning_module, datamodule)
+    trainer.fit(lightning_module, datamodule, ckpt_path=args.resume_from)
 
     print("\n" + "=" * 50)
     print("Training completed!")
@@ -234,13 +242,6 @@ def parse_args():
     )
     parser.add_argument(
         "--train_split", type=float, default=0.8, help="Train/val split ratio"
-    )
-
-    parser.add_argument(
-        "--hidden_channels",
-        type=int,
-        default=128,
-        help="Number of hidden channels in model",
     )
 
     parser.add_argument(
@@ -299,6 +300,12 @@ def parse_args():
         "--development_mode",
         action="store_true",
         help="Use only first song pair for fast iteration",
+    )
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume training from",
     )
 
     return parser.parse_args()
