@@ -3,8 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.tuner import Tuner
-from pathlib import Path
-import argparse
 
 from dataset.dataset import StudioLiveDataModule
 
@@ -13,8 +11,8 @@ from dataset.dataset import StudioLiveDataModule
 class LiveifyModel(torch.nn.Module):
     def __init__(
         self,
-        input_sr=110250,
-        output_sr=110250,
+        input_sr=88200,
+        output_sr=88200,
         hidden_channels=128,
         encoder_strides=[8, 8, 4, 4],
         transformer_dim=256,

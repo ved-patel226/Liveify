@@ -59,15 +59,20 @@ class LiveifyLightningModule(pl.LightningModule):
         learning_rate: float = 1e-4,
         time_loss_weight: float = 1.0,
         spectral_loss_weight: float = 1.0,
+        sample_rate: int = 22050,
     ):
         super().__init__()
         self.model = model
         self.learning_rate = learning_rate
         self.time_loss_weight = time_loss_weight
         self.spectral_loss_weight = spectral_loss_weight
+        self.sample_rate = sample_rate
 
         self.time_loss = nn.L1Loss()
         self.spectral_loss = SpectralLoss()
+
+        self.input_audio_logged = False
+        self.validation_outputs = []
 
         self.save_hyperparameters(ignore=["model"])
 
@@ -108,7 +113,54 @@ class LiveifyLightningModule(pl.LightningModule):
         self.log("val/time_loss", time_loss)
         self.log("val/spectral_loss", spectral_loss)
 
+        # Store outputs for audio logging
+        if batch_idx == 0:  # Only log from first batch to avoid too many samples
+            self.validation_outputs.append(
+                {
+                    "input": x.detach().cpu(),
+                    "target": y.detach().cpu(),
+                    "output": y_pred.detach().cpu(),
+                }
+            )
+
         return total_loss
+
+    def on_validation_epoch_end(self):
+        """Log audio samples at the end of each validation epoch."""
+        if not self.validation_outputs:
+            return
+
+        outputs = self.validation_outputs[0]
+        input_audio = outputs["input"]
+        target_audio = outputs["target"]
+        output_audio = outputs["output"]
+
+        if not self.input_audio_logged and self.logger is not None:
+            for i in range(min(3, input_audio.shape[0])):
+                self.logger.experiment.add_audio(
+                    f"audio/input_sample_{i}",
+                    input_audio[i].unsqueeze(0),
+                    global_step=self.global_step,
+                    sample_rate=self.sample_rate,
+                )
+                self.logger.experiment.add_audio(
+                    f"audio/target_sample_{i}",
+                    target_audio[i].unsqueeze(0),
+                    global_step=self.global_step,
+                    sample_rate=self.sample_rate,
+                )
+            self.input_audio_logged = True
+
+        if self.logger is not None:
+            for i in range(min(3, output_audio.shape[0])):
+                self.logger.experiment.add_audio(
+                    f"audio/output_sample_{i}",
+                    output_audio[i].unsqueeze(0),
+                    global_step=self.global_step,
+                    sample_rate=self.sample_rate,
+                )
+
+        self.validation_outputs.clear()
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
@@ -166,6 +218,7 @@ def train(args):
         learning_rate=args.learning_rate,
         time_loss_weight=args.time_loss_weight,
         spectral_loss_weight=args.spectral_loss_weight,
+        sample_rate=args.sample_rate,
     )
 
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -254,7 +307,7 @@ def parse_args():
         "--max_epochs", type=int, default=100, help="Maximum number of epochs"
     )
     parser.add_argument(
-        "--patience", type=int, default=10, help="Early stopping patience"
+        "--patience", type=int, default=100, help="Early stopping patience"
     )
     parser.add_argument(
         "--num_workers", type=int, default=4, help="Number of dataloader workers"
