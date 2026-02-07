@@ -15,6 +15,25 @@ from model import LiveifyModel
 from dataset.dataset import StudioLiveDataModule
 
 
+def normalize_audio_for_logging(audio: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize audio to [-1, 1] range for safe TensorBoard logging.
+    Clamps values to avoid warnings.
+    """
+    # Ensure we're working with float tensors
+    audio = audio.float()
+
+    # Get max absolute value per batch element
+    batch_size = audio.shape[0]
+    for i in range(batch_size):
+        max_val = torch.max(torch.abs(audio[i]))
+        if max_val > 0:
+            audio[i] = audio[i] / (max_val + 1e-7)
+
+    # Hard clamp to [-1, 1] to avoid floating point artifacts
+    return torch.clamp(audio, -1.0, 1.0)
+
+
 class SpectralLoss(nn.Module):
     """Multi-scale spectral loss for audio quality."""
 
@@ -134,6 +153,11 @@ class LiveifyLightningModule(pl.LightningModule):
         input_audio = outputs["input"]
         target_audio = outputs["target"]
         output_audio = outputs["output"]
+
+        # Normalize all audio for safe logging
+        input_audio = normalize_audio_for_logging(input_audio)
+        target_audio = normalize_audio_for_logging(target_audio)
+        output_audio = normalize_audio_for_logging(output_audio)
 
         if not self.input_audio_logged and self.logger is not None:
             for i in range(min(3, input_audio.shape[0])):
