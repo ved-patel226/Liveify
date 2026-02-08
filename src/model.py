@@ -69,7 +69,7 @@ class LiveifyModel(torch.nn.Module):
         self.encoder_channels = channels
 
         self.pos_embed = nn.Parameter(
-            torch.randn(1, transformer_dim, self.num_patches) * 0.02
+            torch.randn(1, transformer_dim, self.num_patches) * 0.001
         )
 
         # ===== Transformer =====
@@ -77,7 +77,7 @@ class LiveifyModel(torch.nn.Module):
             d_model=transformer_dim,
             nhead=num_heads,
             dim_feedforward=transformer_dim * 4,
-            dropout=0.1,
+            dropout=0.3,
             activation="gelu",
             batch_first=True,
             norm_first=True,
@@ -119,9 +119,15 @@ class LiveifyModel(torch.nn.Module):
 
             in_channels = out_channels
 
-        self.patch_decode = nn.Sequential(*decoder_layers)
+        self.decoder = nn.Sequential(*decoder_layers)
 
-        self._init_near_zero()
+        self.skip_convs = nn.ModuleList()
+        for i in range(len(decoder_strides) - 1):
+            enc_ch = channels[::-1][i]
+            dec_ch = decoder_channels[i + 1]
+            self.skip_convs.append(nn.Conv1d(enc_ch, dec_ch, 1))
+
+        self._init_weights()
 
     def _calculate_channel_progression(self, start_channels, end_channels, num_stages):
         """
@@ -144,22 +150,24 @@ class LiveifyModel(torch.nn.Module):
 
         return channels
 
-    def _init_near_zero(self):
-        """Initialize weights near zero for residual learning."""
+    def _init_weights(self):
+        """Better weight initialization for small models."""
         for m in self.modules():
-            if isinstance(m, nn.Conv1d) or isinstance(m, nn.ConvTranspose1d):
-                nn.init.normal_(m.weight, mean=0.0, std=1e-4)
+            if isinstance(m, (nn.Conv1d, nn.ConvTranspose1d)):
+                # Use smaller initialization scale
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if hasattr(m.weight, "data"):
+                    m.weight.data *= 0.1  # Scale down weights
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.BatchNorm1d):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
-
-        if hasattr(self, "patch_decode"):
-            for layer in reversed(list(self.patch_decode.children())):
-                if isinstance(layer, nn.ConvTranspose1d):
-                    nn.init.normal_(layer.weight, mean=0.0, std=1e-4)
-                    break
+            elif isinstance(m, nn.Linear):
+                # Smaller initialization for transformer layers
+                nn.init.xavier_normal_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x):
         """
@@ -176,8 +184,15 @@ class LiveifyModel(torch.nn.Module):
 
         x_in = x.unsqueeze(1)
 
-        # ===== ENCODE =====
-        patches = self.patch_embed(x_in)
+        # ===== ENCODE  =====
+        encoder_features = []
+        out = x_in
+        for layer in self.patch_embed:
+            out = layer(out)
+            if isinstance(layer, nn.ReLU):
+                encoder_features.append(out)
+
+        patches = encoder_features[-1]
         patches = patches + self.pos_embed
 
         # ===== TRANSFORM =====
@@ -185,15 +200,45 @@ class LiveifyModel(torch.nn.Module):
         transformed = self.transformer(patches)
         transformed = transformed.permute(0, 2, 1)
 
-        # ===== DECODE =====
-        residual = self.patch_decode(transformed)
+        # ===== DECODE with skip connections =====
+        modules = list(self.decoder)
+        idx = 0
+        decoder_out = transformed
+        num_stages = len([m for m in modules if isinstance(m, nn.ConvTranspose1d)])
 
-        if pad_len > 0:
-            residual = residual[:, :, :-pad_len]
+        for i in range(num_stages):
+            conv = modules[idx]
+            assert isinstance(conv, nn.ConvTranspose1d)
+            decoder_out = conv(decoder_out)
+            idx += 1
 
-        residual = residual.squeeze(1)
+            if i < len(self.skip_convs) and i < len(encoder_features):
+                encoder_feat = encoder_features[-(i + 1)]
 
-        return x[:, :seq_len] + residual
+                if decoder_out.shape[2] != encoder_feat.shape[2]:
+                    encoder_feat = F.interpolate(
+                        encoder_feat,
+                        size=decoder_out.shape[2],
+                        mode="linear",
+                        align_corners=False,
+                    )
+
+                skip_feat = self.skip_convs[i](encoder_feat)
+                decoder_out = decoder_out + skip_feat
+
+            if i < num_stages - 1:
+                bn = modules[idx]
+                relu = modules[idx + 1]
+                decoder_out = bn(decoder_out)
+                decoder_out = relu(decoder_out)
+                idx += 2
+            else:
+                tanh = modules[idx]
+                decoder_out = tanh(decoder_out)
+                idx += 1
+
+        output = decoder_out.squeeze(1)
+        return output[:, :seq_len]
 
 
 class LiveifyLRFinderWrapper(pl.LightningModule):
@@ -225,7 +270,7 @@ class LiveifyLRFinderWrapper(pl.LightningModule):
 
 def find_lr(model):
     batch_size = 4
-    seq_length = 22050 * 5  # 5 seconds
+    seq_length = int(22050 * 0.02)  # 20ms = 441 samples
     device = next(model.parameters()).device
     x = torch.randn(batch_size, seq_length).to(device)
 
@@ -246,7 +291,7 @@ def find_lr(model):
         studio_dir="./dataset/studio",
         live_dir="./dataset/live",
         batch_size=4,
-        segment_duration=5.0,
+        segment_duration=0.02,
         development_mode=False,
         num_workers=2,
     )
@@ -266,10 +311,11 @@ def find_lr(model):
         lr_finder = tuner.lr_find(
             lightning_model,
             datamodule,
-            min_lr=1e-6,
+            min_lr=1e-15,
             max_lr=1e-1,
-            num_training=100,
+            num_training=250,
             mode="exponential",
+            early_stop_threshold=15,
         )
 
         fig = lr_finder.plot(suggest=True)
@@ -288,12 +334,14 @@ if __name__ == "__main__":
     from torchinfo import summary
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    input_length = 441  # 22050 * 0.02 = 441 samples (20ms)
+
     model = LiveifyModel(
-        input_sr=110250,
-        output_sr=110250,
+        input_sr=input_length,
+        output_sr=input_length,
         hidden_channels=128,
-        encoder_strides=[8, 4, 4],
-        transformer_dim=(512 + 256) // 2,
+        encoder_strides=[2, 2],
+        transformer_dim=512,
         num_heads=8,
         num_layers=4,
         lr=1e-4,
@@ -301,9 +349,14 @@ if __name__ == "__main__":
 
     find_lr(model)
 
+    # print(f"Model Summary:")
+    # print(f"  Input: (batch, {input_length})")
+    # print(f"  Output: (batch, {input_length}) ")
+    # print()
+
     # summary(
     #     model,
-    #     input_size=(4, 110250),
+    #     input_size=(4, input_length),
     #     col_names=["input_size", "output_size", "num_params"],
     #     depth=3,
     #     device=device,
