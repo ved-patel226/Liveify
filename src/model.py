@@ -7,7 +7,63 @@ from pytorch_lightning.tuner import Tuner
 from dataset.dataset import StudioLiveDataModule
 
 
-# optimal lr: 4.5e-064.5e-06
+#! Watch this performance, HIGHLY EXPIREMENTAL
+# * Grows logarithmically in complexity with input, but it might not be as good as LSTM for shorter contexts
+class HierarchicalContext(nn.Module):
+    def __init__(self, dim=512, num_levels=3):
+        super().__init__()
+        self.num_levels = num_levels
+
+        self.downsamples = nn.ModuleList()
+
+        self.shared_process = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=dim,
+                nhead=8,
+                dim_feedforward=dim * 2,
+                dropout=0.1,
+                batch_first=True,
+                norm_first=True,
+            ),
+            num_layers=2,
+        )
+
+        self.weights = nn.ParameterList()
+
+        for i in range(num_levels):
+            if i > 0:
+                self.downsamples.append(
+                    nn.Conv1d(dim, dim, kernel_size=4, stride=4, padding=0)
+                )
+            else:
+                self.downsamples.append(nn.Identity())
+
+            self.weights.append(nn.Parameter(torch.tensor(1.0 / (i + 1))))
+
+    def forward(self, x):
+        B, C, D = x.shape
+        outputs = []
+        current = x.transpose(1, 2)
+
+        for i in range(self.num_levels):
+            downsampled = self.downsamples[i](current)
+            downsampled = downsampled.transpose(1, 2)
+
+            # ⭐ Use shared transformer
+            processed = self.shared_process(downsampled)
+
+            processed = processed.transpose(1, 2)
+            if processed.shape[2] != C:
+                processed = F.interpolate(
+                    processed, size=C, mode="linear", align_corners=False
+                )
+            processed = processed.transpose(1, 2)
+
+            outputs.append(self.weights[i] * processed)
+
+        return sum(outputs)
+
+
 class LiveifyModel(torch.nn.Module):
     def __init__(
         self,
@@ -18,6 +74,7 @@ class LiveifyModel(torch.nn.Module):
         transformer_dim=256,
         num_heads=8,
         num_layers=4,
+        context_length=1,
         lr=1e-4,
     ):
         super(LiveifyModel, self).__init__()
@@ -26,6 +83,7 @@ class LiveifyModel(torch.nn.Module):
         self.output_sr = output_sr
         self.lr = lr
         self.encoder_strides = encoder_strides
+        self.context_length = context_length
 
         total_stride = 1
         for s in encoder_strides:
@@ -33,7 +91,7 @@ class LiveifyModel(torch.nn.Module):
         self.patch_size = total_stride
         self.num_patches = (input_sr + self.patch_size - 1) // self.patch_size
 
-        # ===== Encoder  =====
+        # ===== Encoder =====
         encoder_layers = []
         in_channels = 1
 
@@ -46,7 +104,6 @@ class LiveifyModel(torch.nn.Module):
 
         for i, stride in enumerate(encoder_strides):
             out_channels = channels[i]
-
             kernel_size = stride * 2 + 1
             padding = kernel_size // 2
 
@@ -60,7 +117,7 @@ class LiveifyModel(torch.nn.Module):
                         padding=padding,
                     ),
                     nn.BatchNorm1d(out_channels),
-                    nn.ReLU(),
+                    nn.GELU(),
                 ]
             )
             in_channels = out_channels
@@ -72,28 +129,42 @@ class LiveifyModel(torch.nn.Module):
             torch.randn(1, transformer_dim, self.num_patches) * 0.001
         )
 
-        # ===== Transformer =====
+        # # ===== LSTM =====
+        # # TODO: check out LSTMx for longer sequences, mabye add an option for that https://arxiv.org/abs/2211.13227
+        # self.lstm = nn.LSTM(
+        #     input_size=transformer_dim,
+        #     hidden_size=lstm_hidden,
+        #     num_layers=lstm_layers,
+        #     batch_first=True,
+        #     bidirectional=True,
+        #     dropout=0.2 if lstm_layers > 1 else 0.0,
+        # )
+        # self.lstm_proj = nn.Linear(lstm_hidden * 2, transformer_dim)
+        # self.lstm_norm = nn.LayerNorm(transformer_dim)
+
+        self.hierarchical_context = HierarchicalContext(
+            dim=transformer_dim, num_levels=3
+        )
+        # ===== Transformer for global attention =====
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=transformer_dim,
             nhead=num_heads,
             dim_feedforward=transformer_dim * 4,
-            dropout=0.3,
+            dropout=0.1,
             activation="gelu",
             batch_first=True,
             norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # ===== Decoder  =====
+        # ===== Decoder =====
         decoder_layers = []
         decoder_strides = encoder_strides[::-1]
-
         decoder_channels = [transformer_dim] + channels[::-1][1:] + [1]
 
         in_channels = transformer_dim
         for i, stride in enumerate(decoder_strides):
             out_channels = decoder_channels[i + 1]
-
             kernel_size = stride * 2
             padding = kernel_size // 2 - stride // 2
 
@@ -108,14 +179,16 @@ class LiveifyModel(torch.nn.Module):
             )
 
             if i < len(decoder_strides) - 1:
+                # GroupNorm instead of BatchNorm cuz it was pretty inconsistant output across segments
+                num_groups = 8
+                while out_channels % num_groups != 0 and num_groups > 1:
+                    num_groups //= 2
                 decoder_layers.extend(
                     [
-                        nn.BatchNorm1d(out_channels),
-                        nn.ReLU(),
+                        nn.GroupNorm(num_groups, out_channels),
+                        nn.ELU(alpha=1.0),  # ELU preserves negative values
                     ]
                 )
-            else:
-                decoder_layers.append(nn.Tanh())
 
             in_channels = out_channels
 
@@ -130,10 +203,6 @@ class LiveifyModel(torch.nn.Module):
         self._init_weights()
 
     def _calculate_channel_progression(self, start_channels, end_channels, num_stages):
-        """
-        Calculate smooth channel progression from start to end.
-        Uses geometric progression for smooth exponential growth.
-        """
         if num_stages == 1:
             return [end_channels]
 
@@ -151,54 +220,98 @@ class LiveifyModel(torch.nn.Module):
         return channels
 
     def _init_weights(self):
-        """Better weight initialization for small models."""
+        """Weight initialization."""
         for m in self.modules():
             if isinstance(m, (nn.Conv1d, nn.ConvTranspose1d)):
-                # Use smaller initialization scale
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-                if hasattr(m.weight, "data"):
-                    m.weight.data *= 0.1  # Scale down weights
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm1d):
+            elif isinstance(m, (nn.BatchNorm1d, nn.GroupNorm)):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
-                # Smaller initialization for transformer layers
-                nn.init.xavier_normal_(m.weight, gain=0.1)
+                nn.init.xavier_normal_(m.weight, gain=0.5)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+
+        decoder_convs = [
+            m for m in self.decoder.modules() if isinstance(m, nn.ConvTranspose1d)
+        ]
+        if decoder_convs:
+            nn.init.zeros_(decoder_convs[-1].weight)
+            if decoder_convs[-1].bias is not None:
+                nn.init.zeros_(decoder_convs[-1].bias)
 
     def forward(self, x):
         """
         Args:
-            x: (batch_size, sequence_length) raw audio
+            x: (batch_size, context_length, segment_length) if context_length > 1
+               or (batch_size, segment_length) if context_length == 1
         Returns:
-            (batch_size, sequence_length) processed audio
+            (batch_size, context_length, segment_length) if context_length > 1
+            or (batch_size, segment_length) if context_length == 1
         """
-        _, seq_len = x.shape
+        has_context = x.dim() == 3
+        if has_context:
+            B, C, S = x.shape  # batch, context_length, segment_length
+        else:
+            B, S = x.shape
+            C = 1
+            x = x.unsqueeze(1)  # (B, 1, S)
+
+        seq_len = S
+
+        # Save original input for residual connection BEFORE padding
+        x_orig = x  # (B, C, S)
 
         pad_len = (self.patch_size - seq_len % self.patch_size) % self.patch_size
         if pad_len > 0:
             x = F.pad(x, (0, pad_len))
+            S_padded = S + pad_len
+        else:
+            S_padded = S
 
-        x_in = x.unsqueeze(1)
+        # Reshape to process all frames through encoder: (B*C, 1, S_padded)
+        x_flat = x.reshape(B * C, 1, S_padded)
 
-        # ===== ENCODE  =====
+        # ===== ENCODE =====
         encoder_features = []
-        out = x_in
+        out = x_flat
         for layer in self.patch_embed:
             out = layer(out)
-            if isinstance(layer, nn.ReLU):
+            if isinstance(layer, nn.GELU):
                 encoder_features.append(out)
 
-        patches = encoder_features[-1]
+        patches = encoder_features[-1]  # (B*C, transformer_dim, num_patches)
         patches = patches + self.pos_embed
 
-        # ===== TRANSFORM =====
-        patches = patches.permute(0, 2, 1)
-        transformed = self.transformer(patches)
-        transformed = transformed.permute(0, 2, 1)
+        # # ===== LSTM =====
+        # # patches: (B*C, D, T) -> (B*C, T, D) for LSTM
+        # lstm_in = patches.permute(0, 2, 1)
+        # lstm_out, _ = self.lstm(lstm_in)  # (B*C, T, lstm_hidden*2)
+        # lstm_out = self.lstm_proj(lstm_out)  # (B*C, T, transformer_dim)
+        # lstm_out = self.lstm_norm(lstm_out + lstm_in)  # residual connection
+
+        lstm_in = patches.permute(0, 2, 1)
+        lstm_out = lstm_in
+
+        if C > 1:
+            T = lstm_out.shape[1]
+            D = lstm_out.shape[2]
+            context_features = lstm_out.reshape(B, C, T, D)
+
+            frame_summary = context_features.mean(dim=2)  # (B, C, D)
+
+            frame_ctx = self.hierarchical_context(frame_summary)  # (B, C, D)
+
+            frame_ctx_expanded = frame_ctx.unsqueeze(2).expand_as(context_features)
+            context_features = context_features + 0.1 * frame_ctx_expanded
+
+            lstm_out = context_features.reshape(B * C, T, D)
+
+        # ===== TRANSFORMER: global attention =====
+        transformed = self.transformer(lstm_out)  # (B*C, T, D)
+        transformed = transformed.permute(0, 2, 1)  # (B*C, D, T)
 
         # ===== DECODE with skip connections =====
         modules = list(self.decoder)
@@ -227,18 +340,24 @@ class LiveifyModel(torch.nn.Module):
                 decoder_out = decoder_out + skip_feat
 
             if i < num_stages - 1:
-                bn = modules[idx]
-                relu = modules[idx + 1]
-                decoder_out = bn(decoder_out)
-                decoder_out = relu(decoder_out)
+                norm = modules[idx]
+                act = modules[idx + 1]
+                decoder_out = norm(decoder_out)
+                decoder_out = act(decoder_out)
                 idx += 2
-            else:
-                tanh = modules[idx]
-                decoder_out = tanh(decoder_out)
-                idx += 1
 
-        output = decoder_out.squeeze(1)
-        return output[:, :seq_len]
+        output = decoder_out.squeeze(1)  # (B*C, S_padded)
+        output = output[:, :seq_len]  # trim padding
+
+        input_flat = x_orig.reshape(B * C, seq_len)
+        output = input_flat + output  # residual learning
+
+        if has_context:
+            output = output.reshape(B, C, seq_len)
+        else:
+            output = output.reshape(B, seq_len)
+
+        return output
 
 
 class LiveifyLRFinderWrapper(pl.LightningModule):
@@ -246,6 +365,7 @@ class LiveifyLRFinderWrapper(pl.LightningModule):
         super().__init__()
         self.model = model
         self.lr = model.lr
+        self.context_length = model.context_length
 
     def forward(self, x):
         return self.model(x)
@@ -265,14 +385,31 @@ class LiveifyLRFinderWrapper(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.lr)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=15, min_lr=1e-8, verbose=True
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
 
 
 def find_lr(model):
     batch_size = 4
     seq_length = int(22050 * 0.02)  # 20ms = 441 samples
+    context_length = model.context_length
     device = next(model.parameters()).device
-    x = torch.randn(batch_size, seq_length).to(device)
+
+    if context_length > 1:
+        x = torch.randn(batch_size, context_length, seq_length).to(device)
+    else:
+        x = torch.randn(batch_size, seq_length).to(device)
 
     print(f"Input shape: {x.shape}")
     y = model(x)
@@ -292,6 +429,7 @@ def find_lr(model):
         live_dir="./dataset/live",
         batch_size=4,
         segment_duration=0.02,
+        context_length=context_length,
         development_mode=False,
         num_workers=2,
     )
@@ -334,31 +472,32 @@ if __name__ == "__main__":
     from torchinfo import summary
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    input_length = 441  # 22050 * 0.02 = 441 samples (20ms)
-
+    input_length = int(22050 * 0.5)  # 0.5s = 11025 samples
+    context_length = 64
     model = LiveifyModel(
         input_sr=input_length,
         output_sr=input_length,
-        hidden_channels=128,
-        encoder_strides=[2, 2],
-        transformer_dim=512,
+        hidden_channels=256,
+        encoder_strides=[8, 4, 4],
+        transformer_dim=256,
         num_heads=8,
-        num_layers=4,
-        lr=1e-4,
+        num_layers=6,
+        context_length=context_length,
+        lr=1e-5,
     ).to(device)
 
-    find_lr(model)
+    # find_lr(model)
 
-    # print(f"Model Summary:")
-    # print(f"  Input: (batch, {input_length})")
-    # print(f"  Output: (batch, {input_length}) ")
-    # print()
+    print(f"Model Summary:")
+    print(f"  Input: (batch, {context_length}, {input_length})")
+    print(f"  Output: (batch, {context_length}, {input_length})")
+    print()
 
-    # summary(
-    #     model,
-    #     input_size=(4, input_length),
-    #     col_names=["input_size", "output_size", "num_params"],
-    #     depth=3,
-    #     device=device,
-    #     verbose=1,
-    # )
+    summary(
+        model,
+        input_size=(4, context_length, input_length),
+        col_names=["input_size", "output_size", "num_params"],
+        depth=3,
+        device=device,
+        verbose=1,
+    )
