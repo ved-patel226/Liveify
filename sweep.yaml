@@ -1,0 +1,20 @@
+program: train.py
+method: bayes
+metric:
+  name: val/loss
+  goal: minimize
+parameters:
+  learning_rate:
+    min: 1e-7
+    max: 1e-2
+    distribution: log_uniform_values
+  max_epochs:
+    value: 10
+  context_length:
+    value: 16
+early_terminate:
+  type: hyperband
+  min_iter: 3
+  max_iter: 10
+  s: 2
+  eta: 3
