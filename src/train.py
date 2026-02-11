@@ -13,7 +13,7 @@ from pathlib import Path
 import argparse
 
 from model import LiveifyModel
-from dataset.dataset import StudioLiveDataModule
+from dataset_utils.dataset import StudioLiveDataModule
 
 
 class SpectrogramLoss(nn.Module):
