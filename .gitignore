@@ -1,7 +1,8 @@
-dataset
+/dataset/
 src/__pycache__
 .cache
 cache/
 checkpoints
 logs
 wandb
+src/dataset_utils/__pycache__
