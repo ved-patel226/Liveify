@@ -1,503 +1,456 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pytorch_lightning as pl
-from pytorch_lightning.tuner import Tuner
-
-from dataset.dataset import StudioLiveDataModule
+from typing import Tuple
+from timm.models.layers import to_2tuple
 
 
-#! Watch this performance, HIGHLY EXPIREMENTAL
-# * Grows logarithmically in complexity with input, but it might not be as good as LSTM for shorter contexts
-class HierarchicalContext(nn.Module):
-    def __init__(self, dim=512, num_levels=3):
+# 3167087.62
+
+
+class PatchEmbedding(nn.Module):
+    """Convert spectrogram to patch embeddings."""
+
+    def __init__(
+        self, img_size=(128, 1024), patch_size=16, in_channels=1, embed_dim=768
+    ):
         super().__init__()
-        self.num_levels = num_levels
+        self.img_size = img_size
+        self.patch_size = to_2tuple(patch_size)
+        self.num_patches_freq = img_size[0] // self.patch_size[0]
+        self.num_patches_time = img_size[1] // self.patch_size[1]
+        self.n_patches = self.num_patches_freq * self.num_patches_time
 
-        self.downsamples = nn.ModuleList()
-
-        self.shared_process = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=dim,
-                nhead=8,
-                dim_feedforward=dim * 2,
-                dropout=0.1,
-                batch_first=True,
-                norm_first=True,
-            ),
-            num_layers=2,
+        self.proj = nn.Conv2d(
+            in_channels, embed_dim, kernel_size=self.patch_size, stride=self.patch_size
         )
 
-        self.weights = nn.ParameterList()
-
-        for i in range(num_levels):
-            if i > 0:
-                self.downsamples.append(
-                    nn.Conv1d(dim, dim, kernel_size=4, stride=4, padding=0)
-                )
-            else:
-                self.downsamples.append(nn.Identity())
-
-            self.weights.append(nn.Parameter(torch.tensor(1.0 / (i + 1))))
-
     def forward(self, x):
-        B, C, D = x.shape
-        outputs = []
-        current = x.transpose(1, 2)
+        x = self.proj(x)
+        x = x.flatten(2)
+        x = x.transpose(1, 2)
+        return x
 
-        for i in range(self.num_levels):
-            downsampled = self.downsamples[i](current)
-            downsampled = downsampled.transpose(1, 2)
 
-            # ⭐ Use shared transformer
-            processed = self.shared_process(downsampled)
+class PositionalEncoding(nn.Module):
+    """
+    2D positional encoding for spectrogram patches
+    """
 
-            processed = processed.transpose(1, 2)
-            if processed.shape[2] != C:
-                processed = F.interpolate(
-                    processed, size=C, mode="linear", align_corners=False
-                )
-            processed = processed.transpose(1, 2)
+    def __init__(
+        self,
+        embed_dim: int,
+        num_patches_freq: int,
+        num_patches_time: int,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_patches_freq = num_patches_freq
+        self.num_patches_time = num_patches_time
+        self.dropout = nn.Dropout(dropout)
 
-            outputs.append(self.weights[i] * processed)
+        self.freq_pos_embed = nn.Parameter(
+            torch.zeros(1, num_patches_freq, embed_dim // 2)
+        )
+        self.time_pos_embed = nn.Parameter(
+            torch.zeros(1, num_patches_time, embed_dim // 2)
+        )
 
-        return sum(outputs)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.trunc_normal_(self.freq_pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.time_pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, num_patches, embed_dim)
+        Returns:
+            (batch, num_patches + 1, embed_dim)
+        """
+        B = x.shape[0]
+
+        freq_pos = self.freq_pos_embed.repeat(1, self.num_patches_time, 1)
+        time_pos = self.time_pos_embed.repeat_interleave(self.num_patches_freq, dim=1)
+        pos_embed = torch.cat(
+            [freq_pos, time_pos], dim=-1
+        )  # (1, num_patches, embed_dim)
+
+        x = x + pos_embed
+
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+
+        return self.dropout(x)
+
+
+class GRUContextModule(nn.Module):
+    """
+    Bidirectional GRU for capturing temporal context across patches
+    """
+
+    def __init__(self, embed_dim: int = 768, num_layers: int = 2, dropout: float = 0.1):
+        super().__init__()
+
+        self.gru = nn.GRU(
+            input_size=embed_dim,
+            hidden_size=embed_dim // 2,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0,
+        )
+
+        self.norm = nn.LayerNorm(embed_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, seq_len, embed_dim)
+        Returns:
+            (batch, seq_len, embed_dim)
+        """
+        gru_out, _ = self.gru(x)  # (B, seq_len, embed_dim)
+
+        x = x + self.dropout(gru_out)
+        x = self.norm(x)
+
+        return x
+
+
+class PatchReconstruction(nn.Module):
+    """
+    Reconstructs spectrogram from patch embeddings
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 768,
+        patch_size: Tuple[int, int] = (16, 16),
+        num_patches_freq: int = 8,
+        num_patches_time: int = 64,
+        out_channels: int = 1,
+    ):
+        super().__init__()
+        self.patch_size = patch_size
+        self.num_patches_freq = num_patches_freq
+        self.num_patches_time = num_patches_time
+
+        patch_dim = patch_size[0] * patch_size[1] * out_channels
+        self.to_patch = nn.Linear(embed_dim, patch_dim)
+
+        self.upsample = nn.Sequential(
+            nn.ConvTranspose2d(
+                in_channels=out_channels,
+                out_channels=out_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+            ),
+            nn.Tanh(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, num_patches, embed_dim)
+        Returns:
+            (batch, channels, freq, time)
+        """
+        B = x.shape[0]
+
+        x = self.to_patch(x)  # (B, num_patches, patch_dim)
+
+        x = x.view(
+            B,
+            self.num_patches_freq,
+            self.num_patches_time,
+            1,  # channels
+            self.patch_size[0],
+            self.patch_size[1],
+        )
+
+        x = x.permute(0, 3, 1, 4, 2, 5)  # (B, C, num_f, patch_f, num_t, patch_t)
+        x = x.contiguous().view(
+            B,
+            1,
+            self.num_patches_freq * self.patch_size[0],
+            self.num_patches_time * self.patch_size[1],
+        )
+
+        x = self.upsample(x)
+
+        return x
+
+
+class TransformerEncoderLayer(nn.Module):
+    """
+    Transformer encoder layer with multi-head self-attention and feedforward network
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 768,
+        num_heads: int = 12,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.1,
+        attention_dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert (
+            self.head_dim * num_heads == embed_dim
+        ), "embed_dim must be divisible by num_heads"
+
+        self.norm1 = nn.LayerNorm(embed_dim)
+
+        # ===== Multi-Head Self-Attention =====
+        self.qkv = nn.Linear(embed_dim, embed_dim * 3)
+        self.attn_drop = nn.Dropout(attention_dropout)
+        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.proj_drop = nn.Dropout(dropout)
+
+        self.norm2 = nn.LayerNorm(embed_dim)
+        mlp_hidden_dim = int(embed_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden_dim, embed_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+
+        x_norm = self.norm1(x)
+        qkv = (
+            self.qkv(x_norm)
+            .reshape(B, N, 3, self.num_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+        )
+        q, k, v = qkv[0], qkv[1], qkv[2]  # (B, num_heads, N, head_dim)
+
+        attn_output = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+            is_causal=False,
+        )  # reduces vram like crazy
+
+        attn_output = attn_output.transpose(1, 2).reshape(B, N, C)
+        attn_output = self.proj(attn_output)
+        attn_output = self.proj_drop(attn_output)
+
+        x = x + attn_output
+
+        x = x + self.mlp(self.norm2(x))
+
+        return x
 
 
 class LiveifyModel(torch.nn.Module):
     def __init__(
         self,
-        input_sr=88200,
-        output_sr=88200,
-        hidden_channels=128,
-        encoder_strides=[8, 8, 4, 4],
-        transformer_dim=256,
-        num_heads=8,
-        num_layers=4,
-        context_length=1,
-        lr=1e-4,
+        input_fdim: int = 128,
+        input_tdim: int = 1024,
+        patch_size: Tuple[int, int] = (16, 16),
+        embed_dim: int = 768,
+        num_transformer_layers: int = 12,
+        num_heads: int = 12,
+        mlp_ratio: float = 4.0,
+        gru_layers: int = 2,
+        dropout: float = 0.1,
+        attention_dropout: float = 0.1,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        *args,
+        **kwargs
     ):
-        super(LiveifyModel, self).__init__()
+        super().__init__(*args, **kwargs)
 
-        self.input_sr = input_sr
-        self.output_sr = output_sr
-        self.lr = lr
-        self.encoder_strides = encoder_strides
-        self.context_length = context_length
+        self.input_fdim = input_fdim
+        self.input_tdim = input_tdim
 
-        total_stride = 1
-        for s in encoder_strides:
-            total_stride *= s
-        self.patch_size = total_stride
-        self.num_patches = (input_sr + self.patch_size - 1) // self.patch_size
-
-        # ===== Encoder =====
-        encoder_layers = []
-        in_channels = 1
-
-        num_stages = len(encoder_strides)
-        channels = self._calculate_channel_progression(
-            start_channels=hidden_channels // 2,
-            end_channels=transformer_dim,
-            num_stages=num_stages,
+        # ===== Patch Embedding =====
+        # input: (batch, channels, freq, time)
+        # output: (batch, num_patches, embed_dim)
+        self.patch_embed = PatchEmbedding(
+            img_size=(input_fdim, input_tdim),
+            patch_size=patch_size,
+            in_channels=in_channels,
+            embed_dim=embed_dim,
         )
 
-        for i, stride in enumerate(encoder_strides):
-            out_channels = channels[i]
-            kernel_size = stride * 2 + 1
-            padding = kernel_size // 2
-
-            encoder_layers.extend(
-                [
-                    nn.Conv1d(
-                        in_channels,
-                        out_channels,
-                        kernel_size=kernel_size,
-                        stride=stride,
-                        padding=padding,
-                    ),
-                    nn.BatchNorm1d(out_channels),
-                    nn.GELU(),
-                ]
-            )
-            in_channels = out_channels
-
-        self.patch_embed = nn.Sequential(*encoder_layers)
-        self.encoder_channels = channels
-
-        self.pos_embed = nn.Parameter(
-            torch.randn(1, transformer_dim, self.num_patches) * 0.001
+        # ===== Positional Encoding =====
+        # input: (batch, num_patches, embed_dim)
+        # output: (batch, num_patches + 1, embed_dim)
+        self.pos_embed = PositionalEncoding(
+            embed_dim=embed_dim,
+            num_patches_freq=self.patch_embed.num_patches_freq,
+            num_patches_time=self.patch_embed.num_patches_time,
+            dropout=dropout,
         )
 
-        # # ===== LSTM =====
-        # # TODO: check out LSTMx for longer sequences, mabye add an option for that https://arxiv.org/abs/2211.13227
-        # self.lstm = nn.LSTM(
-        #     input_size=transformer_dim,
-        #     hidden_size=lstm_hidden,
-        #     num_layers=lstm_layers,
-        #     batch_first=True,
-        #     bidirectional=True,
-        #     dropout=0.2 if lstm_layers > 1 else 0.0,
-        # )
-        # self.lstm_proj = nn.Linear(lstm_hidden * 2, transformer_dim)
-        # self.lstm_norm = nn.LayerNorm(transformer_dim)
+        num_layers_pre_gru = num_transformer_layers // 2
+        num_layers_post_gru = num_transformer_layers - num_layers_pre_gru
 
-        self.hierarchical_context = HierarchicalContext(
-            dim=transformer_dim, num_levels=3
-        )
-        # ===== Transformer for global attention =====
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=transformer_dim,
-            nhead=num_heads,
-            dim_feedforward=transformer_dim * 4,
-            dropout=0.1,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        # ===== Decoder =====
-        decoder_layers = []
-        decoder_strides = encoder_strides[::-1]
-        decoder_channels = [transformer_dim] + channels[::-1][1:] + [1]
-
-        in_channels = transformer_dim
-        for i, stride in enumerate(decoder_strides):
-            out_channels = decoder_channels[i + 1]
-            kernel_size = stride * 2
-            padding = kernel_size // 2 - stride // 2
-
-            decoder_layers.append(
-                nn.ConvTranspose1d(
-                    in_channels,
-                    out_channels,
-                    kernel_size=kernel_size,
-                    stride=stride,
-                    padding=padding,
+        # ===== Transformer Encoder Layers (Pre-GRU) =====
+        # input: (batch, num_patches + 1, embed_dim)
+        # output: (batch, num_patches + 1, embed_dim)
+        self.transformer_pre_gru = nn.ModuleList(
+            [
+                TransformerEncoderLayer(
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                    attention_dropout=attention_dropout,
                 )
-            )
+                for _ in range(num_layers_pre_gru)
+            ]
+        )
 
-            if i < len(decoder_strides) - 1:
-                # GroupNorm instead of BatchNorm cuz it was pretty inconsistant output across segments
-                num_groups = 8
-                while out_channels % num_groups != 0 and num_groups > 1:
-                    num_groups //= 2
-                decoder_layers.extend(
-                    [
-                        nn.GroupNorm(num_groups, out_channels),
-                        nn.ELU(alpha=1.0),  # ELU preserves negative values
-                    ]
+        # ===== GRU Context Module =====
+        # input: (batch, seq_len, embed_dim)
+        # output: (batch, seq_len, embed_dim)
+        self.gru_context = GRUContextModule(
+            embed_dim=embed_dim, num_layers=gru_layers, dropout=dropout
+        )
+
+        # ===== Transformer Encoder Layers (Post-GRU) =====
+        # input: (batch, num_patches + 1, embed_dim)
+        # output: (batch, num_patches + 1, embed_dim)
+        self.transformer_post_gru = nn.ModuleList(
+            [
+                TransformerEncoderLayer(
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                    attention_dropout=attention_dropout,
                 )
+                for _ in range(num_layers_post_gru)
+            ]
+        )
 
-            in_channels = out_channels
+        self.norm = nn.LayerNorm(embed_dim)
 
-        self.decoder = nn.Sequential(*decoder_layers)
+        # ===== Patch Reconstruction =====
+        # input: (batch, num_patches + 1, embed_dim)
+        # output: (batch, channels, freq, time)
+        self.patch_recon = PatchReconstruction(
+            embed_dim=embed_dim,
+            patch_size=patch_size,
+            num_patches_freq=self.patch_embed.num_patches_freq,
+            num_patches_time=self.patch_embed.num_patches_time,
+            out_channels=out_channels,
+        )
 
-        self.skip_convs = nn.ModuleList()
-        for i in range(len(decoder_strides) - 1):
-            enc_ch = channels[::-1][i]
-            dec_ch = decoder_channels[i + 1]
-            self.skip_convs.append(nn.Conv1d(enc_ch, dec_ch, 1))
+        self.apply(self._init_weights)
 
-        self._init_weights()
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
+            nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
 
-    def _calculate_channel_progression(self, start_channels, end_channels, num_stages):
-        if num_stages == 1:
-            return [end_channels]
-
-        ratio = (end_channels / start_channels) ** (1 / (num_stages - 1))
-
-        channels = []
-        for i in range(num_stages):
-            ch = int(start_channels * (ratio**i))
-            # round to nearest 8
-            ch = ((ch + 7) // 8) * 8
-            channels.append(ch)
-
-        channels[-1] = end_channels
-
-        return channels
-
-    def _init_weights(self):
-        """Weight initialization."""
-        for m in self.modules():
-            if isinstance(m, (nn.Conv1d, nn.ConvTranspose1d)):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, (nn.BatchNorm1d, nn.GroupNorm)):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight, gain=0.5)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-        decoder_convs = [
-            m for m in self.decoder.modules() if isinstance(m, nn.ConvTranspose1d)
-        ]
-        if decoder_convs:
-            nn.init.zeros_(decoder_convs[-1].weight)
-            if decoder_convs[-1].bias is not None:
-                nn.init.zeros_(decoder_convs[-1].bias)
-
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (batch_size, context_length, segment_length) if context_length > 1
-               or (batch_size, segment_length) if context_length == 1
+            x: Input spectrogram (batch, channels, freq, time)
         Returns:
-            (batch_size, context_length, segment_length) if context_length > 1
-            or (batch_size, segment_length) if context_length == 1
+            Reconstructed spectrogram (batch, channels, freq, time)
         """
-        has_context = x.dim() == 3
-        if has_context:
-            B, C, S = x.shape  # batch, context_length, segment_length
-        else:
-            B, S = x.shape
-            C = 1
-            x = x.unsqueeze(1)  # (B, 1, S)
+        x = self.patch_embed(x)
 
-        seq_len = S
+        x = self.pos_embed(x)
 
-        # Save original input for residual connection BEFORE padding
-        x_orig = x  # (B, C, S)
+        for layer in self.transformer_pre_gru:
+            x = layer(x)
 
-        pad_len = (self.patch_size - seq_len % self.patch_size) % self.patch_size
-        if pad_len > 0:
-            x = F.pad(x, (0, pad_len))
-            S_padded = S + pad_len
-        else:
-            S_padded = S
+        cls_token = x[:, 0:1, :]
+        x_patches = x[:, 1:, :]
 
-        # Reshape to process all frames through encoder: (B*C, 1, S_padded)
-        x_flat = x.reshape(B * C, 1, S_padded)
+        x_patches = self.gru_context(x_patches)
 
-        # ===== ENCODE =====
-        encoder_features = []
-        out = x_flat
-        for layer in self.patch_embed:
-            out = layer(out)
-            if isinstance(layer, nn.GELU):
-                encoder_features.append(out)
+        x = torch.cat([cls_token, x_patches], dim=1)
 
-        patches = encoder_features[-1]  # (B*C, transformer_dim, num_patches)
-        patches = patches + self.pos_embed
+        for layer in self.transformer_post_gru:
+            x = layer(x)
 
-        # # ===== LSTM =====
-        # # patches: (B*C, D, T) -> (B*C, T, D) for LSTM
-        # lstm_in = patches.permute(0, 2, 1)
-        # lstm_out, _ = self.lstm(lstm_in)  # (B*C, T, lstm_hidden*2)
-        # lstm_out = self.lstm_proj(lstm_out)  # (B*C, T, transformer_dim)
-        # lstm_out = self.lstm_norm(lstm_out + lstm_in)  # residual connection
+        x = self.norm(x)
 
-        lstm_in = patches.permute(0, 2, 1)
-        lstm_out = lstm_in
+        x = x[:, 1:, :]  # dont use cls token for reconstruction
 
-        if C > 1:
-            T = lstm_out.shape[1]
-            D = lstm_out.shape[2]
-            context_features = lstm_out.reshape(B, C, T, D)
+        x = self.patch_recon(x)
 
-            frame_summary = context_features.mean(dim=2)  # (B, C, D)
-
-            frame_ctx = self.hierarchical_context(frame_summary)  # (B, C, D)
-
-            frame_ctx_expanded = frame_ctx.unsqueeze(2).expand_as(context_features)
-            context_features = context_features + 0.1 * frame_ctx_expanded
-
-            lstm_out = context_features.reshape(B * C, T, D)
-
-        # ===== TRANSFORMER: global attention =====
-        transformed = self.transformer(lstm_out)  # (B*C, T, D)
-        transformed = transformed.permute(0, 2, 1)  # (B*C, D, T)
-
-        # ===== DECODE with skip connections =====
-        modules = list(self.decoder)
-        idx = 0
-        decoder_out = transformed
-        num_stages = len([m for m in modules if isinstance(m, nn.ConvTranspose1d)])
-
-        for i in range(num_stages):
-            conv = modules[idx]
-            assert isinstance(conv, nn.ConvTranspose1d)
-            decoder_out = conv(decoder_out)
-            idx += 1
-
-            if i < len(self.skip_convs) and i < len(encoder_features):
-                encoder_feat = encoder_features[-(i + 1)]
-
-                if decoder_out.shape[2] != encoder_feat.shape[2]:
-                    encoder_feat = F.interpolate(
-                        encoder_feat,
-                        size=decoder_out.shape[2],
-                        mode="linear",
-                        align_corners=False,
-                    )
-
-                skip_feat = self.skip_convs[i](encoder_feat)
-                decoder_out = decoder_out + skip_feat
-
-            if i < num_stages - 1:
-                norm = modules[idx]
-                act = modules[idx + 1]
-                decoder_out = norm(decoder_out)
-                decoder_out = act(decoder_out)
-                idx += 2
-
-        output = decoder_out.squeeze(1)  # (B*C, S_padded)
-        output = output[:, :seq_len]  # trim padding
-
-        input_flat = x_orig.reshape(B * C, seq_len)
-        output = input_flat + output  # residual learning
-
-        if has_context:
-            output = output.reshape(B, C, seq_len)
-        else:
-            output = output.reshape(B, seq_len)
-
-        return output
+        return x
 
 
-class LiveifyLRFinderWrapper(pl.LightningModule):
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-        self.lr = model.lr
-        self.context_length = model.context_length
+def main() -> None:
+    from torchinfo import summary
 
-    def forward(self, x):
-        return self.model(x)
+    import torch.profiler as profiler
 
-    def training_step(self, batch, batch_idx):
-        x, y = batch
-        y_pred = self(x)
-        loss = torch.nn.functional.l1_loss(y_pred, y)
-        self.log("train_loss", loss)
-        return loss
+    model = LiveifyModel(
+        input_fdim=128,
+        input_tdim=1024,
+        patch_size=(16, 16),
+        embed_dim=512,
+        num_transformer_layers=3,
+        num_heads=4,
+        mlp_ratio=4.0,
+        gru_layers=2,
+        dropout=0.1,
+        attention_dropout=0.1,
+        in_channels=1,
+        out_channels=1,
+    ).to("cuda")
 
-    def validation_step(self, batch, batch_idx):
-        x, y = batch
-        y_pred = self(x)
-        loss = torch.nn.functional.l1_loss(y_pred, y)
-        self.log("val_loss", loss)
-        return loss
+    summary(model, input_size=(1, 1, 128, 1024))
 
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=15, min_lr=1e-8, verbose=True
+    dummy_input = torch.randn(1, 1, 128, 1024).to("cuda")
+
+    with profiler.profile(
+        activities=[
+            profiler.ProfilerActivity.CPU,
+            profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+    ) as prof:
+        with profiler.record_function("model_inference"):
+            output = model(dummy_input)
+
+    # prof.export_chrome_trace("liveify_profiler_trace.json")
+    with open("profiler_stats.txt", "w") as f:
+        f.write(
+            prof.key_averages().table(
+                sort_by="cuda_time_total",
+                row_limit=20,
+            )
         )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val_loss",
-                "interval": "epoch",
-                "frequency": 1,
-            },
-        }
-
-
-def find_lr(model):
-    batch_size = 4
-    seq_length = int(22050 * 0.02)  # 20ms = 441 samples
-    context_length = model.context_length
-    device = next(model.parameters()).device
-
-    if context_length > 1:
-        x = torch.randn(batch_size, context_length, seq_length).to(device)
-    else:
-        x = torch.randn(batch_size, seq_length).to(device)
-
-    print(f"Input shape: {x.shape}")
-    y = model(x)
-    print(f"Output shape: {y.shape}")
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\nTotal parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-
-    print("\n" + "=" * 50)
-    print("Testing Learning Rate Finder...")
-    print("=" * 50 + "\n")
-
-    datamodule = StudioLiveDataModule(
-        studio_dir="./dataset/studio",
-        live_dir="./dataset/live",
-        batch_size=4,
-        segment_duration=0.02,
-        context_length=context_length,
-        development_mode=False,
-        num_workers=2,
-    )
-
-    lightning_model = LiveifyLRFinderWrapper(model)
-
-    trainer = pl.Trainer(
-        max_epochs=5,
-        accelerator="auto",
-        devices=1,
-        enable_checkpointing=False,
-        logger=False,
-    )
-
-    try:
-        tuner = Tuner(trainer)
-        lr_finder = tuner.lr_find(
-            lightning_model,
-            datamodule,
-            min_lr=1e-15,
-            max_lr=1e-1,
-            num_training=250,
-            mode="exponential",
-            early_stop_threshold=15,
-        )
-
-        fig = lr_finder.plot(suggest=True)
-        fig.savefig("lr_finder_test.png")
-        print(f"Learning rate finder plot saved to: lr_finder_test.png")
-
-        suggested_lr = lr_finder.suggestion()
-        print(f"Suggested learning rate: {suggested_lr:.2e}")
-
-    except Exception as e:
-        print(f"Error running lr_find: {e}")
-        print("Make sure dataset paths are correct and data is available.")
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
 
 
 if __name__ == "__main__":
-    from torchinfo import summary
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    input_length = int(22050 * 0.5)  # 0.5s = 11025 samples
-    context_length = 64
-    model = LiveifyModel(
-        input_sr=input_length,
-        output_sr=input_length,
-        hidden_channels=256,
-        encoder_strides=[8, 4, 4],
-        transformer_dim=256,
-        num_heads=8,
-        num_layers=6,
-        context_length=context_length,
-        lr=1e-5,
-    ).to(device)
-
-    # find_lr(model)
-
-    print(f"Model Summary:")
-    print(f"  Input: (batch, {context_length}, {input_length})")
-    print(f"  Output: (batch, {context_length}, {input_length})")
-    print()
-
-    summary(
-        model,
-        input_size=(4, context_length, input_length),
-        col_names=["input_size", "output_size", "num_params"],
-        depth=3,
-        device=device,
-        verbose=1,
-    )
+    main()
