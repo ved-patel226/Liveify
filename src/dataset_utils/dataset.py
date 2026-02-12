@@ -147,7 +147,7 @@ class StudioLiveDataset(Dataset):
 
     def _get_cache_key(self) -> str:
         """Generate a unique cache key based on dataset configuration."""
-        config_str = f"{self.studio_dir}_{self.live_dir}_{self.sr}_{self.segment_length}_{self.min_lyric_similarity}_{self.development_mode}_{self.context_length}_spec"
+        config_str = f"{self.studio_dir}_{self.live_dir}_{self.sr}_{self.segment_length}_{self.min_lyric_similarity}_{self.development_mode}_{self.context_length}_spec_db-80_20_v2"
         return hashlib.md5(config_str.encode()).hexdigest()
 
     def _get_cache_path(self) -> Optional[str]:
@@ -186,13 +186,14 @@ class StudioLiveDataset(Dataset):
                 print(f"Warning: Failed to save cache: {e}")
 
     def _audio_to_spectrogram(self, audio: np.ndarray) -> np.ndarray:
-        """Convert audio waveform to mel-spectrogram.
+        """Convert audio waveform to mel-spectrogram, normalized to [-1, 1].
 
         Args:
-            audio: Audio waveform array
+            audio: Audio waveform array (should NOT be pre-normalized)
 
         Returns:
-            Mel-spectrogram array with shape (n_mels, time_frames)
+            Normalized mel-spectrogram array with shape (n_mels, time_frames),
+            values in [-1, 1] (maps from power_to_db range [-80, 20] dB).
         """
         #  mel-spectrogram
         mel_spec = librosa.feature.melspectrogram(
@@ -200,14 +201,19 @@ class StudioLiveDataset(Dataset):
             sr=self.sr,
             n_fft=2048,
             hop_length=512,
-            n_mels=128,
+            n_mels=256,
             fmin=20,
             fmax=8000,
         )
 
-        mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)  # log scale (db)
+        mel_spec_db = librosa.power_to_db(mel_spec, ref=1.0)
 
-        return mel_spec_db
+        # Clip to a wider range to avoid ceiling/saturation at 0 dB
+        db_min, db_max = -80.0, 20.0
+        mel_spec_db = np.clip(mel_spec_db, db_min, db_max)
+        mel_spec_norm = 2.0 * (mel_spec_db - db_min) / (db_max - db_min) - 1.0
+
+        return mel_spec_norm
 
     def _load_audio(self, path: str) -> np.ndarray:
         y, _ = librosa.load(path, sr=self.sr)
@@ -331,6 +337,10 @@ class StudioLiveDataset(Dataset):
                 live_audio, match["live_start"], match["live_end"]
             )
 
+            # Track actual audio length before any padding
+            studio_real_len = len(studio_seg)
+            live_real_len = len(live_seg)
+
             if self.alignment_length is not None:
                 # pad/trim to alignment_length (>= segment_length, min 5s for Whisper)
                 for arr_name in ["studio_seg", "live_seg"]:
@@ -351,29 +361,28 @@ class StudioLiveDataset(Dataset):
                 and self.alignment_length is not None
                 and self.segment_length < self.alignment_length
             ):
-                num_sub = len(studio_seg) // self.segment_length
+                # Only keep sub-segments that fall entirely within the real (non-padded) audio
+                max_real_samples = min(studio_real_len, live_real_len)
+                max_full_subs = max_real_samples // self.segment_length
+                num_sub = min(len(studio_seg) // self.segment_length, max_full_subs)
+
                 for j in range(num_sub):
                     start = j * self.segment_length
                     end = start + self.segment_length
                     sub_studio = studio_seg[start:end]
                     sub_live = live_seg[start:end]
 
-                    # skip silent sub-segments
-                    if (
-                        np.max(np.abs(sub_studio)) < 1e-6
-                        and np.max(np.abs(sub_live)) < 1e-6
-                    ):
+                    # Skip silent/near-silent sub-segments
+                    studio_rms = np.sqrt(np.mean(sub_studio**2))
+                    live_rms = np.sqrt(np.mean(sub_live**2))
+                    if studio_rms < 0.01 or live_rms < 0.01:
                         continue
 
-                    studio_max = np.max(np.abs(sub_studio))
-                    live_max = np.max(np.abs(sub_live))
-                    sub_studio_norm = (
-                        sub_studio / studio_max if studio_max > 1e-7 else sub_studio
-                    )
-                    sub_live_norm = sub_live / live_max if live_max > 1e-7 else sub_live
-
-                    studio_spec = self._audio_to_spectrogram(sub_studio_norm)
-                    live_spec = self._audio_to_spectrogram(sub_live_norm)
+                    # Do NOT peak-normalize per segment — let the spectrogram
+                    # use absolute magnitudes so that quiet vs loud segments
+                    # have different spectrogram values
+                    studio_spec = self._audio_to_spectrogram(sub_studio)
+                    live_spec = self._audio_to_spectrogram(sub_live)
 
                     segments.append(
                         {
@@ -398,16 +407,15 @@ class StudioLiveDataset(Dataset):
                     studio_seg = studio_seg[: self.segment_length]
                     live_seg = live_seg[: self.segment_length]
 
-                # Precompute spectrograms and cache them
-                studio_max = np.max(np.abs(studio_seg))
-                live_max = np.max(np.abs(live_seg))
-                studio_norm = (
-                    studio_seg / studio_max if studio_max > 1e-7 else studio_seg
-                )
-                live_norm = live_seg / live_max if live_max > 1e-7 else live_seg
+                # Skip silent segments
+                studio_rms = np.sqrt(np.mean(studio_seg**2))
+                live_rms = np.sqrt(np.mean(live_seg**2))
+                if studio_rms < 0.01 or live_rms < 0.01:
+                    continue
 
-                studio_spec = self._audio_to_spectrogram(studio_norm)
-                live_spec = self._audio_to_spectrogram(live_norm)
+                # Do NOT peak-normalize — use raw audio for spectrogram
+                studio_spec = self._audio_to_spectrogram(studio_seg)
+                live_spec = self._audio_to_spectrogram(live_seg)
 
                 segments.append(
                     {
@@ -509,27 +517,27 @@ class StudioLiveDataset(Dataset):
         if self.context_length <= 1:
             return [(i, 1) for i in range(len(self.pairs))]
 
-        # group consecutive segments by song pair and segment_idx
         groups = {}
         for i, pair in enumerate(self.pairs):
-            key = (pair["studio_name"], pair["live_name"], pair.get("segment_idx", 0))
+            key = (pair["studio_name"], pair["live_name"])
             if key not in groups:
                 groups[key] = []
             groups[key].append(i)
 
         for key in groups:
-            groups[key].sort(key=lambda idx: self.pairs[idx].get("sub_segment_idx", 0))
+            groups[key].sort(
+                key=lambda idx: (
+                    self.pairs[idx].get("segment_idx", 0),
+                    self.pairs[idx].get("sub_segment_idx", 0),
+                )
+            )
 
-        # sliding windows of context_length
         windows = []
         for key, indices in groups.items():
             if len(indices) >= self.context_length:
                 for start in range(len(indices) - self.context_length + 1):
                     window_indices = indices[start : start + self.context_length]
                     windows.append(window_indices)
-            else:
-                padded = indices + [indices[-1]] * (self.context_length - len(indices))
-                windows.append(padded)
 
         return windows
 

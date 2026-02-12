@@ -3,7 +3,7 @@ import torch
 torch.set_float32_matmul_precision("high")
 
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 
 
 import torch.nn as nn
@@ -14,28 +14,40 @@ import argparse
 
 from model import LiveifyModel
 from dataset_utils.dataset import StudioLiveDataModule
+from augmentation import SpectrogramAugmentation
 
 
 class SpectrogramLoss(nn.Module):
-    """Loss for spectrogram-based models."""
+    """Loss for spectrogram-based models.
 
-    def __init__(self):
+    Combines L1 (sharp edges), MSE (stability), and spectral convergence
+    (frequency-domain accuracy) for crisp spectrogram reconstruction.
+    """
+
+    def __init__(self, l1_weight=0.7, mse_weight=0.15, spectral_weight=0.15):
         super().__init__()
         self.mse_loss = nn.MSELoss()
         self.l1_loss = nn.L1Loss()
+        self.l1_weight = l1_weight
+        self.mse_weight = mse_weight
+        self.spectral_weight = spectral_weight
+
+    def spectral_convergence_loss(self, pred, target):
+        """Spectral convergence: Frobenius norm ratio along frequency axis."""
+        return torch.norm(target - pred, p="fro") / (torch.norm(target, p="fro") + 1e-7)
 
     def forward(self, pred, target):
-        """Compute combined MSE and L1 loss on spectrograms.
+        """Compute combined loss on spectrograms.
 
         Args:
             pred: (batch, channels, freq, time) or (batch, context, channels, freq, time)
             target: same shape as pred
         """
-        mse = self.mse_loss(pred, target)
-
         l1 = self.l1_loss(pred, target)
+        mse = self.mse_loss(pred, target)
+        sc = self.spectral_convergence_loss(pred, target)
 
-        return 0.5 * mse + 0.5 * l1
+        return self.l1_weight * l1 + self.mse_weight * mse + self.spectral_weight * sc
 
 
 class LiveifyLightningModule(pl.LightningModule):
@@ -44,6 +56,10 @@ class LiveifyLightningModule(pl.LightningModule):
         model: LiveifyModel,
         learning_rate: float = 1e-4,
         sample_rate: int = 22050,
+        use_augmentation: bool = True,
+        aug_freq_mask: int = 20,
+        aug_time_mask: int = 40,
+        aug_noise_std: float = 0.01,
     ):
         super().__init__()
         self.model = model
@@ -51,6 +67,18 @@ class LiveifyLightningModule(pl.LightningModule):
         self.sample_rate = sample_rate
 
         self.loss_fn = SpectrogramLoss()
+
+        if use_augmentation:
+            self.augmentation = SpectrogramAugmentation(
+                freq_mask_param=aug_freq_mask,
+                time_mask_param=aug_time_mask,
+                num_freq_masks=2,
+                num_time_masks=2,
+                noise_std=aug_noise_std,
+                p=0.5,
+            )
+        else:
+            self.augmentation = None
 
         self.validation_outputs = []
 
@@ -92,20 +120,22 @@ class LiveifyLightningModule(pl.LightningModule):
 
     def _prepare_batch(self, x, y):
         """
-        OPTIMIZED: Simplified batch preparation.
+        Prepare batch by concatenating context segments along the time axis.
 
         Returns:
-            x: (B*Ctx, 1, F, T) - ready for model
-            y: (B*Ctx, 1, F, T) - ready for loss
+            x: (B, 1, F, Ctx*T) - context segments concatenated in time
+            y: (B, 1, F, Ctx*T) - context segments concatenated in time
             B: original batch size
             Ctx: context length
         """
         if x.dim() == 3:
+            # (B, F, T) -> (B, 1, F, T)
             return x.unsqueeze(1), y.unsqueeze(1), x.shape[0], 1
         elif x.dim() == 4:
+            # (B, Ctx, F, T) -> (B, 1, F, Ctx*T)
             B, Ctx, F, T = x.shape
-            x = x.contiguous().view(B * Ctx, 1, F, T)
-            y = y.contiguous().view(B * Ctx, 1, F, T)
+            x = x.permute(0, 2, 1, 3).contiguous().view(B, 1, F, Ctx * T)
+            y = y.permute(0, 2, 1, 3).contiguous().view(B, 1, F, Ctx * T)
             return x, y, B, Ctx
         else:
             raise ValueError(f"Unexpected input dim: {x.dim()}")
@@ -113,6 +143,9 @@ class LiveifyLightningModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x, y = batch  # studio (input), live (target)
         x, y, B, Ctx = self._prepare_batch(x, y)
+
+        if self.augmentation is not None:
+            x = self.augmentation(x)
 
         y_pred = self(x)
 
@@ -163,14 +196,14 @@ class LiveifyLightningModule(pl.LightningModule):
             self.parameters(),
             lr=self.learning_rate,
             betas=(0.9, 0.98),
-            weight_decay=1e-6,
+            weight_decay=1e-3,
         )
 
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="min",
             factor=0.5,
-            patience=30,
+            patience=300,
             min_lr=1e-8,
         )
 
@@ -179,7 +212,7 @@ class LiveifyLightningModule(pl.LightningModule):
             "lr_scheduler": {
                 "scheduler": scheduler,
                 "interval": "epoch",
-                "monitor": "val/loss",
+                "monitor": "train/loss",
             },
         }
 
@@ -209,13 +242,23 @@ def train(args=None):
         development_mode=args.development_mode,
     )
 
-    time_frames = int(
+    time_frames_per_segment = int(
         (args.sample_rate * args.segment_duration) / 512
-    )  # 22050 * 0.5 / 512 = ~22 frames for 0.5s segments with hop_length=512
+    )  # 22050 * 0.5 / 512 = ~22 frames per segment with hop_length=512
     patch_size = args.patch_size
-    input_tdim = (time_frames // patch_size) * patch_size
+
+    total_time_frames = time_frames_per_segment * args.context_length
+    input_tdim = (total_time_frames // patch_size) * patch_size
     if input_tdim < patch_size:
         input_tdim = patch_size
+
+    print(f"Spectrogram config:")
+    print(f"  Frames per segment: {time_frames_per_segment}")
+    print(f"  Context length: {args.context_length}")
+    print(f"  Total time frames: {total_time_frames} -> input_tdim: {input_tdim}")
+    print(
+        f"  Patches: {128 // patch_size} freq x {input_tdim // patch_size} time = {(128 // patch_size) * (input_tdim // patch_size)} total"
+    )
 
     model = LiveifyModel(
         input_fdim=128,  # n_mels from dataset
@@ -236,38 +279,51 @@ def train(args=None):
         model=model,
         learning_rate=learning_rate,
         sample_rate=args.sample_rate,
+        use_augmentation=args.use_augmentation,
+        aug_freq_mask=args.aug_freq_mask,
+        aug_time_mask=args.aug_time_mask,
+        aug_noise_std=args.aug_noise_std,
     )
 
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    monitor_metric = "train/loss" if args.train_split >= 1.0 else "val/loss"
+
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_dir,
         filename="best",
-        monitor="val/loss",
+        monitor=monitor_metric,
         mode="min",
         save_top_k=1,
         save_last=True,
     )
 
-    early_stop_callback = EarlyStopping(
-        monitor="val/loss",
-        patience=args.patience,
-        mode="min",
-        verbose=True,
-    )
+    # early_stop_callback = EarlyStopping(
+    #     monitor="val/loss",
+    #     patience=args.patience,
+    #     mode="min",
+    #     verbose=True,
+    # )
 
-    logger = TensorBoardLogger(
-        save_dir=args.log_dir,
-        name="liveify",
-    )
+    if args.logger == "wandb":
+        logger = WandbLogger(
+            project="liveify",
+            save_dir=args.log_dir,
+            log_model=False,
+        )
+    else:
+        logger = TensorBoardLogger(
+            save_dir=args.log_dir,
+            name="liveify",
+        )
 
     trainer = pl.Trainer(
         max_epochs=max_epochs,
         accelerator="auto",
         devices=1,
         precision=args.precision,
-        callbacks=[checkpoint_callback, early_stop_callback],
+        callbacks=[checkpoint_callback],
         logger=logger,
         log_every_n_steps=1,
         gradient_clip_val=1,
@@ -315,10 +371,10 @@ def parse_args():
         "--context_length",
         type=int,
         default=64,
-        help="Number of consecutive segments for LSTM temporal context",
+        help="Number of consecutive segments concatenated along time axis for temporal context",
     )
     parser.add_argument(
-        "--train_split", type=float, default=0.8, help="Train/val split ratio"
+        "--train_split", type=float, default=1, help="Train/val split ratio"
     )
 
     parser.add_argument(
@@ -331,7 +387,7 @@ def parse_args():
         "--max_epochs", type=int, default=100, help="Maximum number of epochs"
     )
     parser.add_argument(
-        "--patience", type=int, default=10, help="Early stopping patience"
+        "--patience", type=int, default=1000, help="Early stopping patience"
     )
     parser.add_argument(
         "--num_workers", type=int, default=10, help="Number of dataloader workers"
@@ -359,13 +415,13 @@ def parse_args():
     parser.add_argument(
         "--num_transformer_layers",
         type=int,
-        default=8,
+        default=4,
         help="Number of transformer encoder layers",
     )
     parser.add_argument(
         "--num_heads",
         type=int,
-        default=8,
+        default=4,
         help="Number of attention heads",
     )
     parser.add_argument(
@@ -377,19 +433,19 @@ def parse_args():
     parser.add_argument(
         "--gru_layers",
         type=int,
-        default=2,
+        default=4,
         help="Number of GRU layers",
     )
     parser.add_argument(
         "--dropout",
         type=float,
-        default=0.1,
+        default=0.3,
         help="Dropout rate",
     )
     parser.add_argument(
         "--attention_dropout",
         type=float,
-        default=0.1,
+        default=0.3,
         help="Attention dropout rate",
     )
     parser.add_argument(
@@ -400,6 +456,36 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--use_augmentation",
+        action="store_true",
+        default=True,
+        help="Use data augmentation during training",
+    )
+    parser.add_argument(
+        "--no_augmentation",
+        dest="use_augmentation",
+        action="store_false",
+        help="Disable data augmentation",
+    )
+    parser.add_argument(
+        "--aug_freq_mask",
+        type=int,
+        default=20,
+        help="Maximum frequency mask width for SpecAugment",
+    )
+    parser.add_argument(
+        "--aug_time_mask",
+        type=int,
+        default=40,
+        help="Maximum time mask width for SpecAugment",
+    )
+    parser.add_argument(
+        "--aug_noise_std",
+        type=float,
+        default=0.01,
+        help="Standard deviation of Gaussian noise to add",
+    )
+    parser.add_argument(
         "--checkpoint_dir",
         type=str,
         default="./checkpoints",
@@ -407,6 +493,13 @@ def parse_args():
     )
     parser.add_argument(
         "--log_dir", type=str, default="./logs", help="Directory to save logs"
+    )
+    parser.add_argument(
+        "--logger",
+        type=str,
+        default="tensorboard",
+        choices=["tensorboard", "wandb"],
+        help="Logger to use for experiment tracking",
     )
 
     parser.add_argument(
