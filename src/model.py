@@ -145,15 +145,13 @@ class PatchReconstruction(nn.Module):
         patch_dim = patch_size[0] * patch_size[1] * out_channels
         self.to_patch = nn.Linear(embed_dim, patch_dim)
 
-        self.upsample = nn.Sequential(
-            nn.ConvTranspose2d(
-                in_channels=out_channels,
-                out_channels=out_channels,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-            ),
-            nn.Tanh(),
+        # Multi-layer refinement to smooth patch boundaries and sharpen detail
+        self.refine = nn.Sequential(
+            nn.Conv2d(out_channels, 32, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, out_channels, kernel_size=3, padding=1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -184,7 +182,7 @@ class PatchReconstruction(nn.Module):
             self.num_patches_time * self.patch_size[1],
         )
 
-        x = self.upsample(x)
+        x = self.refine(x)
 
         return x
 
@@ -228,6 +226,9 @@ class TransformerEncoderLayer(nn.Module):
             nn.Linear(mlp_hidden_dim, embed_dim),
             nn.Dropout(dropout),
         )
+
+        nn.init.zeros_(self.proj.weight)  # Attention output projection
+        nn.init.zeros_(self.mlp[-2].weight)  # Second MLP layer
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
@@ -361,16 +362,16 @@ class LiveifyModel(torch.nn.Module):
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-        elif isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
-            nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
+            if m is self.patch_recon.to_patch:
+                nn.init.zeros_(
+                    m.weight
+                )  # or very small: nn.init.normal_(m.weight, std=1e-4)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            else:
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -449,7 +450,6 @@ def main() -> None:
                 row_limit=20,
             )
         )
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
 
 
 if __name__ == "__main__":
