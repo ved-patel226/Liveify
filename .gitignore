@@ -7,3 +7,4 @@ logs
 wandb
 src/dataset_utils/__pycache__
 src/notebooks/cache
+spectrograms

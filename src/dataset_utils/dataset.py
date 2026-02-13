@@ -147,7 +147,7 @@ class StudioLiveDataset(Dataset):
 
     def _get_cache_key(self) -> str:
         """Generate a unique cache key based on dataset configuration."""
-        config_str = f"{self.studio_dir}_{self.live_dir}_{self.sr}_{self.segment_length}_{self.min_lyric_similarity}_{self.development_mode}_{self.context_length}_spec_db-80_20_v2"
+        config_str = f"{self.studio_dir}_{self.live_dir}_{self.sr}_{self.segment_length}_{self.min_lyric_similarity}_{self.development_mode}_{self.context_length}_spec_db-80_20_v5"
         return hashlib.md5(config_str.encode()).hexdigest()
 
     def _get_cache_path(self) -> Optional[str]:
@@ -195,7 +195,7 @@ class StudioLiveDataset(Dataset):
             Normalized mel-spectrogram array with shape (n_mels, time_frames),
             values in [-1, 1] (maps from power_to_db range [-80, 20] dB).
         """
-        #  mel-spectrogram
+        # mel-spectrogram
         mel_spec = librosa.feature.melspectrogram(
             y=audio,
             sr=self.sr,
@@ -208,7 +208,6 @@ class StudioLiveDataset(Dataset):
 
         mel_spec_db = librosa.power_to_db(mel_spec, ref=1.0)
 
-        # Clip to a wider range to avoid ceiling/saturation at 0 dB
         db_min, db_max = -80.0, 20.0
         mel_spec_db = np.clip(mel_spec_db, db_min, db_max)
         mel_spec_norm = 2.0 * (mel_spec_db - db_min) / (db_max - db_min) - 1.0
@@ -337,34 +336,14 @@ class StudioLiveDataset(Dataset):
                 live_audio, match["live_start"], match["live_end"]
             )
 
-            # Track actual audio length before any padding
             studio_real_len = len(studio_seg)
             live_real_len = len(live_seg)
 
-            if self.alignment_length is not None:
-                # pad/trim to alignment_length (>= segment_length, min 5s for Whisper)
-                for arr_name in ["studio_seg", "live_seg"]:
-                    arr = locals()[arr_name]
-                    if len(arr) < self.alignment_length:
-                        arr = np.pad(arr, (0, self.alignment_length - len(arr)))
-                    else:
-                        arr = arr[: self.alignment_length]
-                    locals()[arr_name]
-                    if arr_name == "studio_seg":
-                        studio_seg = arr
-                    else:
-                        live_seg = arr
-
-            # if segment_length < alignment_length, chop aligned chunks into sub-segments
-            if (
-                self.segment_length is not None
-                and self.alignment_length is not None
-                and self.segment_length < self.alignment_length
+            if self.segment_length is not None and self.segment_length < max(
+                studio_real_len, live_real_len
             ):
-                # Only keep sub-segments that fall entirely within the real (non-padded) audio
                 max_real_samples = min(studio_real_len, live_real_len)
-                max_full_subs = max_real_samples // self.segment_length
-                num_sub = min(len(studio_seg) // self.segment_length, max_full_subs)
+                num_sub = max_real_samples // self.segment_length
 
                 for j in range(num_sub):
                     start = j * self.segment_length
@@ -372,17 +351,18 @@ class StudioLiveDataset(Dataset):
                     sub_studio = studio_seg[start:end]
                     sub_live = live_seg[start:end]
 
-                    # Skip silent/near-silent sub-segments
                     studio_rms = np.sqrt(np.mean(sub_studio**2))
                     live_rms = np.sqrt(np.mean(sub_live**2))
                     if studio_rms < 0.01 or live_rms < 0.01:
                         continue
 
-                    # Do NOT peak-normalize per segment — let the spectrogram
-                    # use absolute magnitudes so that quiet vs loud segments
-                    # have different spectrogram values
+                    # do NOT peak-normalize per segment
                     studio_spec = self._audio_to_spectrogram(sub_studio)
                     live_spec = self._audio_to_spectrogram(sub_live)
+
+                    seg_duration = self.segment_length / self.sr
+                    studio_abs_start = match["studio_start"] + j * seg_duration
+                    live_abs_start = match["live_start"] + j * seg_duration
 
                     segments.append(
                         {
@@ -399,6 +379,8 @@ class StudioLiveDataset(Dataset):
                             "sub_segment_idx": j,
                             "studio_text": match["studio_text"],
                             "live_text": match["live_text"],
+                            "studio_start_sec": studio_abs_start,
+                            "live_start_sec": live_abs_start,
                         }
                     )
             else:
@@ -407,7 +389,6 @@ class StudioLiveDataset(Dataset):
                     studio_seg = studio_seg[: self.segment_length]
                     live_seg = live_seg[: self.segment_length]
 
-                # Skip silent segments
                 studio_rms = np.sqrt(np.mean(studio_seg**2))
                 live_rms = np.sqrt(np.mean(live_seg**2))
                 if studio_rms < 0.01 or live_rms < 0.01:
@@ -431,6 +412,8 @@ class StudioLiveDataset(Dataset):
                         "segment_idx": i,
                         "studio_text": match["studio_text"],
                         "live_text": match["live_text"],
+                        "studio_start_sec": match["studio_start"],
+                        "live_start_sec": match["live_start"],
                     }
                 )
 
@@ -511,11 +494,17 @@ class StudioLiveDataset(Dataset):
     def _build_context_indices(self):
         """
         Build index for context_length windows of consecutive segments.
-        Groups segments by song and segment_idx, then creates sliding windows.
-        Returns list of (start_idx, count) tuples into self.pairs.
+        Groups segments by song, sorts by absolute timestamp, and only creates
+        windows from segments that are truly temporally contiguous (no gaps
+        from skipped silent segments or cross-lyric-match boundaries).
         """
         if self.context_length <= 1:
             return [(i, 1) for i in range(len(self.pairs))]
+
+        seg_duration = self.segment_length / self.sr if self.segment_length else None
+        # seg_duration + leftover + whisper_gap (~0.8-2.0s for 0.5s segments).
+        # jumps to completely different song sections.
+        continuity_tolerance = seg_duration * 4.0 if seg_duration else None
 
         groups = {}
         for i, pair in enumerate(self.pairs):
@@ -526,19 +515,51 @@ class StudioLiveDataset(Dataset):
 
         for key in groups:
             groups[key].sort(
-                key=lambda idx: (
-                    self.pairs[idx].get("segment_idx", 0),
-                    self.pairs[idx].get("sub_segment_idx", 0),
-                )
+                key=lambda idx: self.pairs[idx].get("studio_start_sec", 0.0)
             )
 
         windows = []
         for key, indices in groups.items():
-            if len(indices) >= self.context_length:
-                for start in range(len(indices) - self.context_length + 1):
-                    window_indices = indices[start : start + self.context_length]
-                    windows.append(window_indices)
+            if len(indices) < self.context_length:
+                continue
 
+            contiguous_runs = []
+            current_run = [indices[0]]
+
+            for k in range(1, len(indices)):
+                prev_pair = self.pairs[indices[k - 1]]
+                curr_pair = self.pairs[indices[k]]
+
+                prev_studio_start = prev_pair.get("studio_start_sec", 0.0)
+                curr_studio_start = curr_pair.get("studio_start_sec", 0.0)
+
+                time_gap = curr_studio_start - prev_studio_start
+                is_contiguous = (
+                    continuity_tolerance is not None
+                    and 0 < time_gap <= continuity_tolerance
+                )
+
+                if is_contiguous:
+                    current_run.append(indices[k])
+                else:
+                    contiguous_runs.append(current_run)
+                    current_run = [indices[k]]
+
+            contiguous_runs.append(current_run)
+
+            run_lengths = [len(r) for r in contiguous_runs]
+            print(
+                f"  Song {key[0][:25]}: {len(indices)} segments → {len(contiguous_runs)} contiguous runs (lengths: {run_lengths[:10]}{'...' if len(run_lengths) > 10 else ''})"
+            )
+            for run in contiguous_runs:
+                if len(run) >= self.context_length:
+                    for start in range(len(run) - self.context_length + 1):
+                        window_indices = run[start : start + self.context_length]
+                        windows.append(window_indices)
+
+        print(
+            f"Context windows: {len(windows)} (context_length={self.context_length}, tolerance={continuity_tolerance:.2f}s)"
+        )
         return windows
 
     def __len__(self) -> int:
