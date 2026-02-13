@@ -11,6 +11,10 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from pathlib import Path
 import argparse
+import matplotlib.pyplot as plt
+import matplotlib
+
+matplotlib.use("Agg")  # Non-interactive backend for saving figures
 
 from model import LiveifyModel
 from dataset_utils.dataset import StudioLiveDataModule
@@ -18,36 +22,78 @@ from augmentation import SpectrogramAugmentation
 
 
 class SpectrogramLoss(nn.Module):
-    """Loss for spectrogram-based models.
+    """Loss for spectrogram-based models combining spectral convergence, SI-SDR, and phase-sensitive spectral approximation."""
 
-    Combines L1 (sharp edges), MSE (stability), and spectral convergence
-    (frequency-domain accuracy) for crisp spectrogram reconstruction.
-    """
-
-    def __init__(self, l1_weight=0.7, mse_weight=0.15, spectral_weight=0.15):
+    def __init__(
+        self,
+        si_sdr_weight=0.5,
+        psa_weight=0.5,
+    ):
         super().__init__()
-        self.mse_loss = nn.MSELoss()
-        self.l1_loss = nn.L1Loss()
-        self.l1_weight = l1_weight
-        self.mse_weight = mse_weight
-        self.spectral_weight = spectral_weight
+        self.si_sdr_weight = si_sdr_weight
+        self.psa_weight = psa_weight
 
-    def spectral_convergence_loss(self, pred, target):
-        """Spectral convergence: Frobenius norm ratio along frequency axis."""
-        return torch.norm(target - pred, p="fro") / (torch.norm(target, p="fro") + 1e-7)
+    def _l2_norm(self, s1, s2):
+        """L2 norm between two signals."""
+        norm = torch.sum(s1 * s2, -1, keepdim=True)
+        return norm
 
-    def forward(self, pred, target):
+    def _si_snr(self, s1, s2, eps=1e-8):
+        """Scale-Invariant Signal-to-Noise Ratio."""
+        s1_s2_norm = self._l2_norm(s1, s2)
+        s2_s2_norm = self._l2_norm(s2, s2)
+        s_target = s1_s2_norm / (s2_s2_norm + eps) * s2
+        e_noise = s1 - s_target
+        target_norm = self._l2_norm(s_target, s_target)
+        noise_norm = self._l2_norm(e_noise, e_noise)
+        snr = 10 * torch.log10((target_norm) / (noise_norm + eps) + eps)
+        return torch.mean(snr)
+
+    def _loss_sisdr(self, inputs, targets):
+        """SI-SDR loss (negative SI-SNR for minimization)."""
+        return -self._si_snr(inputs, targets)
+
+    def loss_phase_sensitive_spectral_approximation(self, enhance, target, mixture):
+        """
+        Phase-sensitive spectral approximation loss.
+        Reference: Erdogan, Hakan, et al. "Phase-sensitive and recognition-boosted speech separation using deep recurrent neural networks." ICASSP 2015.
+        """
+        eps = nn.Parameter(
+            data=torch.ones((1,), dtype=torch.float32) * 1e-9, requires_grad=False
+        ).to(enhance.device)
+        angle_mixture = torch.tanh(mixture[..., 1] / (mixture[..., 0] + eps))
+        angle_target = torch.tanh(target[..., 1] / (target[..., 0] + eps))
+        amplitude_enhance = torch.sqrt(enhance[..., 1] ** 2 + enhance[..., 0] ** 2)
+        amplitude_target = torch.sqrt(target[..., 1] ** 2 + target[..., 0] ** 2)
+        loss = amplitude_enhance - amplitude_target * torch.cos(
+            angle_target - angle_mixture
+        )
+        loss = torch.mean(loss**2)  # mse
+        return loss
+
+    def forward(self, pred, target, mixture=None):
         """Compute combined loss on spectrograms.
 
         Args:
-            pred: (batch, channels, freq, time) or (batch, context, channels, freq, time)
+            pred: (batch, channels, freq, time)
             target: same shape as pred
+            mixture: (batch, channels, freq, time), optional for PSA loss
         """
-        l1 = self.l1_loss(pred, target)
-        mse = self.mse_loss(pred, target)
-        sc = self.spectral_convergence_loss(pred, target)
+        loss = 0.0
 
-        return self.l1_weight * l1 + self.mse_weight * mse + self.spectral_weight * sc
+        if self.si_sdr_weight > 0:
+            pred_flat = pred.reshape(pred.shape[0], -1)
+            target_flat = target.reshape(target.shape[0], -1)
+            sisdr = self._loss_sisdr(pred_flat, target_flat)
+            loss = loss + self.si_sdr_weight * sisdr
+
+        if self.psa_weight > 0 and mixture is not None:
+            psa = self.loss_phase_sensitive_spectral_approximation(
+                pred, target, mixture
+            )
+            loss = loss + self.psa_weight * psa
+
+        return loss
 
 
 class LiveifyLightningModule(pl.LightningModule):
@@ -66,7 +112,10 @@ class LiveifyLightningModule(pl.LightningModule):
         self.learning_rate = learning_rate
         self.sample_rate = sample_rate
 
-        self.loss_fn = SpectrogramLoss()
+        self.loss_fn = SpectrogramLoss(
+            psa_weight=0.5,
+            si_sdr_weight=0.5,
+        )
 
         if use_augmentation:
             self.augmentation = SpectrogramAugmentation(
@@ -81,6 +130,8 @@ class LiveifyLightningModule(pl.LightningModule):
             self.augmentation = None
 
         self.validation_outputs = []
+        self.saved_input_target = False  # Track if we've saved input/target once
+        self.sample_for_visualization = None  # Store a sample for visualization
 
         self.save_hyperparameters(ignore=["model"])
 
@@ -167,14 +218,15 @@ class LiveifyLightningModule(pl.LightningModule):
 
         self.log("val/loss", loss, prog_bar=True)
 
+        if batch_idx == 0 and self.sample_for_visualization is None:
+            self.sample_for_visualization = {
+                "input": x[0:1].detach().cpu(),
+                "target": y[0:1].detach().cpu(),
+            }
+
         if batch_idx == 0:
-            self.validation_outputs.append(
-                {
-                    "input": x.detach().cpu(),
-                    "target": y.detach().cpu(),
-                    "output": y_pred.detach().cpu(),
-                }
-            )
+            if self.sample_for_visualization is not None:
+                self.sample_for_visualization["output"] = y_pred[0:1].detach().cpu()
 
         return loss
 
@@ -188,8 +240,54 @@ class LiveifyLightningModule(pl.LightningModule):
             self.log("train/grad_norm", total_norm, on_step=True, on_epoch=False)
 
     def on_validation_epoch_end(self):
-        """Clean up validation outputs."""
-        self.validation_outputs.clear()
+        """Save spectrograms every 10 epochs."""
+        if self.sample_for_visualization is None:
+            return
+
+        current_epoch = self.current_epoch
+
+        if not self.saved_input_target:
+            self._save_spectrogram(
+                self.sample_for_visualization["input"][0, 0].numpy(),
+                "input_studio",
+                "Studio Recording (Input)",
+            )
+            self._save_spectrogram(
+                self.sample_for_visualization["target"][0, 0].numpy(),
+                "target_live",
+                "Live Recording (Target)",
+            )
+            self.saved_input_target = True
+
+        if current_epoch % 10 == 0 and "output" in self.sample_for_visualization:
+            self._save_spectrogram(
+                self.sample_for_visualization["output"][0, 0].float().numpy(),
+                f"output_epoch_{current_epoch:04d}",
+                f"Model Prediction - Epoch {current_epoch}",
+            )
+
+    def _save_spectrogram(self, spec, filename, title):
+        """Save a single spectrogram to file."""
+        output_dir = Path("./spectrograms")
+        output_dir.mkdir(exist_ok=True)
+
+        fig, ax = plt.subplots(figsize=(12, 4))
+
+        im = ax.imshow(
+            spec, aspect="auto", origin="lower", cmap="viridis", vmin=-1, vmax=1
+        )
+        ax.set_title(title, fontsize=12, fontweight="bold")
+        ax.set_ylabel("Mel Frequency Bin")
+        ax.set_xlabel("Time Frame")
+        plt.colorbar(im, ax=ax, label="Normalized Magnitude")
+
+        plt.tight_layout()
+
+        save_path = output_dir / f"{filename}.png"
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+        print(f"Saved spectrogram: {save_path}")
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
@@ -268,7 +366,6 @@ def train(args=None):
         num_transformer_layers=args.num_transformer_layers,
         num_heads=args.num_heads,
         mlp_ratio=args.mlp_ratio,
-        gru_layers=args.gru_layers,
         dropout=args.dropout,
         attention_dropout=args.attention_dropout,
         in_channels=1,
@@ -374,7 +471,7 @@ def parse_args():
         help="Number of consecutive segments concatenated along time axis for temporal context",
     )
     parser.add_argument(
-        "--train_split", type=float, default=1, help="Train/val split ratio"
+        "--train_split", type=float, default=0.8, help="Train/val split ratio"
     )
 
     parser.add_argument(
@@ -431,12 +528,6 @@ def parse_args():
         help="MLP hidden dimension ratio",
     )
     parser.add_argument(
-        "--gru_layers",
-        type=int,
-        default=4,
-        help="Number of GRU layers",
-    )
-    parser.add_argument(
         "--dropout",
         type=float,
         default=0.3,
@@ -485,6 +576,7 @@ def parse_args():
         default=0.01,
         help="Standard deviation of Gaussian noise to add",
     )
+
     parser.add_argument(
         "--checkpoint_dir",
         type=str,

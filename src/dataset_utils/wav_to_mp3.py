@@ -40,7 +40,6 @@ def main(root=None, quality="192", delete_wav=False):
             if not os.path.isfile(src):
                 continue
 
-            # Create output filename
             base = os.path.splitext(name)[0]
             dst = os.path.join(d, base + ".mp3")
 

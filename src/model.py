@@ -89,41 +89,6 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-class GRUContextModule(nn.Module):
-    """
-    Bidirectional GRU for capturing temporal context across patches
-    """
-
-    def __init__(self, embed_dim: int = 768, num_layers: int = 2, dropout: float = 0.1):
-        super().__init__()
-
-        self.gru = nn.GRU(
-            input_size=embed_dim,
-            hidden_size=embed_dim // 2,
-            num_layers=num_layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=dropout if num_layers > 1 else 0,
-        )
-
-        self.norm = nn.LayerNorm(embed_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (batch, seq_len, embed_dim)
-        Returns:
-            (batch, seq_len, embed_dim)
-        """
-        gru_out, _ = self.gru(x)  # (B, seq_len, embed_dim)
-
-        x = x + self.dropout(gru_out)
-        x = self.norm(x)
-
-        return x
-
-
 class PatchReconstruction(nn.Module):
     """
     Reconstructs spectrogram from patch embeddings
@@ -145,7 +110,6 @@ class PatchReconstruction(nn.Module):
         patch_dim = patch_size[0] * patch_size[1] * out_channels
         self.to_patch = nn.Linear(embed_dim, patch_dim)
 
-        # Multi-layer refinement to smooth patch boundaries and sharpen detail
         self.refine = nn.Sequential(
             nn.Conv2d(out_channels, 32, kernel_size=3, padding=1),
             nn.GELU(),
@@ -270,7 +234,6 @@ class LiveifyModel(torch.nn.Module):
         num_transformer_layers: int = 12,
         num_heads: int = 12,
         mlp_ratio: float = 4.0,
-        gru_layers: int = 2,
         dropout: float = 0.1,
         attention_dropout: float = 0.1,
         in_channels: int = 1,
@@ -303,13 +266,10 @@ class LiveifyModel(torch.nn.Module):
             dropout=dropout,
         )
 
-        num_layers_pre_gru = num_transformer_layers // 2
-        num_layers_post_gru = num_transformer_layers - num_layers_pre_gru
-
-        # ===== Transformer Encoder Layers (Pre-GRU) =====
+        # ===== Transformer Encoder Layers =====
         # input: (batch, num_patches + 1, embed_dim)
         # output: (batch, num_patches + 1, embed_dim)
-        self.transformer_pre_gru = nn.ModuleList(
+        self.transformer_layers = nn.ModuleList(
             [
                 TransformerEncoderLayer(
                     embed_dim=embed_dim,
@@ -318,30 +278,7 @@ class LiveifyModel(torch.nn.Module):
                     dropout=dropout,
                     attention_dropout=attention_dropout,
                 )
-                for _ in range(num_layers_pre_gru)
-            ]
-        )
-
-        # ===== GRU Context Module =====
-        # input: (batch, seq_len, embed_dim)
-        # output: (batch, seq_len, embed_dim)
-        self.gru_context = GRUContextModule(
-            embed_dim=embed_dim, num_layers=gru_layers, dropout=dropout
-        )
-
-        # ===== Transformer Encoder Layers (Post-GRU) =====
-        # input: (batch, num_patches + 1, embed_dim)
-        # output: (batch, num_patches + 1, embed_dim)
-        self.transformer_post_gru = nn.ModuleList(
-            [
-                TransformerEncoderLayer(
-                    embed_dim=embed_dim,
-                    num_heads=num_heads,
-                    mlp_ratio=mlp_ratio,
-                    dropout=dropout,
-                    attention_dropout=attention_dropout,
-                )
-                for _ in range(num_layers_post_gru)
+                for _ in range(num_transformer_layers)
             ]
         )
 
@@ -384,22 +321,12 @@ class LiveifyModel(torch.nn.Module):
 
         x = self.pos_embed(x)
 
-        for layer in self.transformer_pre_gru:
-            x = layer(x)
-
-        cls_token = x[:, 0:1, :]
-        x_patches = x[:, 1:, :]
-
-        x_patches = self.gru_context(x_patches)
-
-        x = torch.cat([cls_token, x_patches], dim=1)
-
-        for layer in self.transformer_post_gru:
+        for layer in self.transformer_layers:
             x = layer(x)
 
         x = self.norm(x)
 
-        x = x[:, 1:, :]  # dont use cls token for reconstruction
+        x = x[:, 1:, :]  # remove cls token for reconstruction
 
         x = self.patch_recon(x)
 
@@ -419,7 +346,6 @@ def main() -> None:
         num_transformer_layers=3,
         num_heads=4,
         mlp_ratio=4.0,
-        gru_layers=2,
         dropout=0.1,
         attention_dropout=0.1,
         in_channels=1,
