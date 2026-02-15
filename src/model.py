@@ -339,7 +339,7 @@ def main() -> None:
     import torch.profiler as profiler
 
     model = LiveifyModel(
-        input_fdim=128,
+        input_fdim=256,
         input_tdim=1024,
         patch_size=(16, 16),
         embed_dim=512,
@@ -352,9 +352,9 @@ def main() -> None:
         out_channels=1,
     ).to("cuda")
 
-    summary(model, input_size=(1, 1, 128, 1024))
+    summary(model, input_size=(1, 1, 256, 1024))
 
-    dummy_input = torch.randn(1, 1, 128, 1024).to("cuda")
+    dummy_input = torch.randn(1, 1, 256, 1024).to("cuda")
 
     with profiler.profile(
         activities=[
