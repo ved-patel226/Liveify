@@ -26,12 +26,14 @@ class SpectrogramLoss(nn.Module):
 
     def __init__(
         self,
-        si_sdr_weight=0.5,
-        psa_weight=0.5,
+        si_sdr_weight=0,
+        psa_weight=1,
+        l1_weight=0.1,
     ):
         super().__init__()
         self.si_sdr_weight = si_sdr_weight
         self.psa_weight = psa_weight
+        self.l1_weight = l1_weight
 
     def _l2_norm(self, s1, s2):
         """L2 norm between two signals."""
@@ -93,6 +95,10 @@ class SpectrogramLoss(nn.Module):
             )
             loss = loss + self.psa_weight * psa
 
+        if self.l1_weight > 0:
+            l1 = F.l1_loss(pred, target)
+            loss = loss + self.l1_weight * l1
+
         return loss
 
 
@@ -113,8 +119,9 @@ class LiveifyLightningModule(pl.LightningModule):
         self.sample_rate = sample_rate
 
         self.loss_fn = SpectrogramLoss(
-            psa_weight=0.5,
-            si_sdr_weight=0.5,
+            psa_weight=5.0,
+            si_sdr_weight=0,
+            l1_weight=1.0,
         )
 
         if use_augmentation:
@@ -355,11 +362,11 @@ def train(args=None):
     print(f"  Context length: {args.context_length}")
     print(f"  Total time frames: {total_time_frames} -> input_tdim: {input_tdim}")
     print(
-        f"  Patches: {128 // patch_size} freq x {input_tdim // patch_size} time = {(128 // patch_size) * (input_tdim // patch_size)} total"
+        f"  Patches: {256 // patch_size} freq x {input_tdim // patch_size} time = {(256 // patch_size) * (input_tdim // patch_size)} total"
     )
 
     model = LiveifyModel(
-        input_fdim=128,  # n_mels from dataset
+        input_fdim=256,  # n_mels from dataset
         input_tdim=input_tdim,
         patch_size=(patch_size, patch_size),
         embed_dim=args.embed_dim,
