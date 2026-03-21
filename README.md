@@ -165,7 +165,6 @@ Duration of each audio segment in seconds (default: 0.5)
 
 - `--context_length`: Number of consecutive segments concatenated for temporal context (default: 64)
 - `--train_split`: Train/validation split ratio (default: 0.8)
-- `--development_mode`: Use only first song pair for fast iteration
 
 **Training:**
 

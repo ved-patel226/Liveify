@@ -34,6 +34,12 @@ class SpectrogramAugmentation(nn.Module):
         self.num_time_masks = num_time_masks
         self.noise_std = noise_std
         self.p = p
+        # additional safeguards to avoid destroying the entire spec
+        # masks will be at most this fraction of the corresponding dimension
+        self.max_freq_mask_frac = 0.2
+        self.max_time_mask_frac = 0.2
+        # value used to fill masked regions (zero by default but can be mean/median)
+        self.mask_value = 0.0
 
     def forward(self, spec: torch.Tensor) -> torch.Tensor:
         """
@@ -59,19 +65,36 @@ class SpectrogramAugmentation(nn.Module):
             if torch.rand(1).item() > self.p:
                 continue
 
+            # frequency masks (limit size relative to F)
+            max_f = int(F * self.max_freq_mask_frac)
             for _ in range(self.num_freq_masks):
-                f = int(torch.rand(1).item() * self.freq_mask_param)
+                if max_f <= 0:
+                    break
+                f = int(torch.rand(1).item() * min(self.freq_mask_param, max_f))
+                if f == 0:
+                    continue
                 f0 = int(torch.rand(1).item() * (F - f))
-                spec[b, :, f0 : f0 + f, :] = 0
+                spec[b, :, f0 : f0 + f, :] = self.mask_value
 
+            # time masks (limit size relative to T)
+            max_t = int(T * self.max_time_mask_frac)
             for _ in range(self.num_time_masks):
-                t = int(torch.rand(1).item() * self.time_mask_param)
+                if max_t <= 0:
+                    break
+                t = int(torch.rand(1).item() * min(self.time_mask_param, max_t))
+                if t == 0:
+                    continue
                 t0 = int(torch.rand(1).item() * max(1, T - t))
-                spec[b, :, :, t0 : t0 + t] = 0
+                spec[b, :, :, t0 : t0 + t] = self.mask_value
 
             if self.noise_std > 0:
-                noise = torch.randn_like(spec[b]) * self.noise_std
+                # scale noise by the mean magnitude of this spec to avoid overwhelming it
+                mean_mag = spec[b].abs().mean().clamp(min=1e-6)
+                noise = torch.randn_like(spec[b]) * self.noise_std * mean_mag
                 spec[b] = spec[b] + noise
+
+        # clamp to the original range in case noise pushed values outside
+        spec = spec.clamp(-1.0, 1.0)
 
         if not batch_mode:
             spec = spec.squeeze(0)

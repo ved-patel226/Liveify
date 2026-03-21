@@ -9,3 +9,5 @@ src/dataset_utils/__pycache__
 src/notebooks/cache
 spectrograms
 dataset copy
+src/notebooks/cache_audio.npz
+datasetv2

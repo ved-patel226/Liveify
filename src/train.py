@@ -2,19 +2,23 @@ import torch
 
 torch.set_float32_matmul_precision("high")
 
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
-
 
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from pathlib import Path
 import argparse
-import matplotlib.pyplot as plt
-import matplotlib
+import io
 
-matplotlib.use("Agg")  # Non-interactive backend for saving figures
+import matplotlib
+import matplotlib.pyplot as plt
+
+matplotlib.use("Agg")
+
+import librosa
+import numpy as np
 
 from model import LiveifyModel
 from dataset_utils.dataset import StudioLiveDataModule
@@ -22,84 +26,284 @@ from augmentation import SpectrogramAugmentation
 
 
 class SpectrogramLoss(nn.Module):
-    """Loss for spectrogram-based models combining spectral convergence, SI-SDR, and phase-sensitive spectral approximation."""
+    """
+    SIMPLIFIED Loss for mel spectrograms.
+    Uses L1 (sparse differences) + L2 (overall structure).
+    No PSA or SI-SNR since we're working with mel spectrograms, not complex spectrograms.
+    """
 
-    def __init__(
-        self,
-        si_sdr_weight=0,
-        psa_weight=1,
-        l1_weight=0.1,
-    ):
+    def __init__(self, l1_weight=1.0, l2_weight=1.0):
         super().__init__()
-        self.si_sdr_weight = si_sdr_weight
-        self.psa_weight = psa_weight
         self.l1_weight = l1_weight
-
-    def _l2_norm(self, s1, s2):
-        """L2 norm between two signals."""
-        norm = torch.sum(s1 * s2, -1, keepdim=True)
-        return norm
-
-    def _si_snr(self, s1, s2, eps=1e-8):
-        """Scale-Invariant Signal-to-Noise Ratio."""
-        s1_s2_norm = self._l2_norm(s1, s2)
-        s2_s2_norm = self._l2_norm(s2, s2)
-        s_target = s1_s2_norm / (s2_s2_norm + eps) * s2
-        e_noise = s1 - s_target
-        target_norm = self._l2_norm(s_target, s_target)
-        noise_norm = self._l2_norm(e_noise, e_noise)
-        snr = 10 * torch.log10((target_norm) / (noise_norm + eps) + eps)
-        return torch.mean(snr)
-
-    def _loss_sisdr(self, inputs, targets):
-        """SI-SDR loss (negative SI-SNR for minimization)."""
-        return -self._si_snr(inputs, targets)
-
-    def loss_phase_sensitive_spectral_approximation(self, enhance, target, mixture):
-        """
-        Phase-sensitive spectral approximation loss.
-        Reference: Erdogan, Hakan, et al. "Phase-sensitive and recognition-boosted speech separation using deep recurrent neural networks." ICASSP 2015.
-        """
-        eps = nn.Parameter(
-            data=torch.ones((1,), dtype=torch.float32) * 1e-9, requires_grad=False
-        ).to(enhance.device)
-        angle_mixture = torch.tanh(mixture[..., 1] / (mixture[..., 0] + eps))
-        angle_target = torch.tanh(target[..., 1] / (target[..., 0] + eps))
-        amplitude_enhance = torch.sqrt(enhance[..., 1] ** 2 + enhance[..., 0] ** 2)
-        amplitude_target = torch.sqrt(target[..., 1] ** 2 + target[..., 0] ** 2)
-        loss = amplitude_enhance - amplitude_target * torch.cos(
-            angle_target - angle_mixture
-        )
-        loss = torch.mean(loss**2)  # mse
-        return loss
+        self.l2_weight = l2_weight
 
     def forward(self, pred, target, mixture=None):
-        """Compute combined loss on spectrograms.
-
+        """
         Args:
-            pred: (batch, channels, freq, time)
-            target: same shape as pred
-            mixture: (batch, channels, freq, time), optional for PSA loss
+            pred: model output (batch, channels, freq, time)
+            target: target spectrogram (batch, channels, freq, time)
+            mixture: unused (for compatibility)
+        Returns:
+            scalar loss
         """
         loss = 0.0
 
-        if self.si_sdr_weight > 0:
-            pred_flat = pred.reshape(pred.shape[0], -1)
-            target_flat = target.reshape(target.shape[0], -1)
-            sisdr = self._loss_sisdr(pred_flat, target_flat)
-            loss = loss + self.si_sdr_weight * sisdr
-
-        if self.psa_weight > 0 and mixture is not None:
-            psa = self.loss_phase_sensitive_spectral_approximation(
-                pred, target, mixture
-            )
-            loss = loss + self.psa_weight * psa
-
+        # L1 loss for sparse differences
         if self.l1_weight > 0:
-            l1 = F.l1_loss(pred, target)
-            loss = loss + self.l1_weight * l1
+            loss += self.l1_weight * F.l1_loss(pred, target)
+
+        # L2 loss for overall structure
+        if self.l2_weight > 0:
+            loss += self.l2_weight * F.mse_loss(pred, target)
 
         return loss
+
+
+def audio_to_mel_tensor(
+    audio: torch.Tensor,
+    sr: int,
+    n_mels: int = 256,
+    n_fft: int = 1024,
+    hop_length: int = 512,
+) -> torch.Tensor:
+    """(B, slots, samples) -> (B, slots, 1, n_mels, T)"""
+    B, slots, samples = audio.shape
+    device = audio.device
+
+    mel_fb = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels, fmax=sr // 2)
+    mel_fb = torch.tensor(mel_fb, dtype=torch.float32, device=device)
+    window = torch.hann_window(n_fft, device=device)
+
+    specs = []
+    for slot_idx in range(slots):
+        slot_audio = audio[:, slot_idx, :]
+        stft = torch.stft(
+            slot_audio,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=n_fft,
+            window=window,
+            return_complex=True,
+        )
+        power = stft.abs() ** 2
+        mel = torch.matmul(mel_fb, power)
+        mel_db = 10.0 * torch.log10(mel.clamp(min=1e-9))
+        mel_min = mel_db.amin(dim=(-2, -1), keepdim=True)
+        mel_max = mel_db.amax(dim=(-2, -1), keepdim=True)
+        mel_db = 2.0 * (mel_db - mel_min) / (mel_max - mel_min + 1e-8) - 1.0
+        specs.append(mel_db.unsqueeze(1))
+
+    return torch.stack(specs, dim=1)
+
+
+def mel_to_audio_griffin_lim(
+    mel_spec: np.ndarray,  # (F, T) normalised [-1, 1]
+    sr: int,
+    n_fft: int = 1024,
+    hop_length: int = 512,
+    n_iter: int = 64,
+) -> np.ndarray:
+    """
+    Rough Griffin-Lim inversion of a normalised mel spectrogram.
+    Good enough to hear whether the model is producing reasonable structure.
+    """
+    mel_db = (mel_spec + 1.0) * 40.0 - 80.0
+    mel_power = np.power(10.0, mel_db / 10.0)
+
+    n_mels = mel_spec.shape[0]
+    mel_fb = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels)
+    mel_fb_inv = np.linalg.pinv(mel_fb)  # (n_fft//2+1, n_mels)
+    linear_power = np.maximum(mel_fb_inv @ mel_power, 0.0)
+    linear_mag = np.sqrt(linear_power)
+
+    audio = librosa.griffinlim(
+        linear_mag, n_iter=n_iter, hop_length=hop_length, win_length=n_fft
+    )
+    peak = np.abs(audio).max()
+    if peak > 0:
+        audio = audio / peak * 0.9
+    return audio.astype(np.float32)
+
+
+_SPEC_KW = dict(aspect="auto", origin="lower", cmap="magma", vmin=-1, vmax=1)
+_DIFF_KW = dict(aspect="auto", origin="lower", cmap="RdBu_r", vmin=-1, vmax=1)
+
+
+def _fig_to_numpy(fig) -> np.ndarray:
+    """Render a matplotlib figure to an (H, W, 3) uint8 array."""
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+    buf.seek(0)
+    from PIL import Image
+
+    img = np.array(Image.open(buf).convert("RGB"))
+    buf.close()
+    return img
+
+
+def make_comparison_figure(
+    studio: np.ndarray,
+    output: np.ndarray,
+    target: np.ndarray,
+    epoch: int,
+    sample_idx: int,
+) -> plt.Figure:
+    diff = output - target
+    mae = np.abs(diff).mean()
+
+    fig, axes = plt.subplots(1, 4, figsize=(22, 4))
+    fig.suptitle(
+        f"Epoch {epoch}  |  Sample {sample_idx}  |  MAE = {mae:.4f}",
+        fontsize=11,
+        fontweight="bold",
+    )
+
+    panels = [
+        (studio, "Studio (input)", _SPEC_KW),
+        (output, "Model output", _SPEC_KW),
+        (target, "Live target", _SPEC_KW),
+        (diff, "Signed diff (out-tgt)", _DIFF_KW),
+    ]
+    for ax, (data, title, kw) in zip(axes, panels):
+        im = ax.imshow(data, **kw)
+        ax.set_title(title, fontsize=9)
+        ax.set_xlabel("Time frame")
+        ax.set_ylabel("Mel bin")
+        plt.colorbar(im, ax=ax, shrink=0.8)
+
+    fig.tight_layout()
+    return fig
+
+
+def make_context_strip_figure(
+    context_slots: np.ndarray,  # (S, F, T)
+    num_context: int,
+    epoch: int,
+    sample_idx: int,
+) -> plt.Figure:
+    S, F, T = context_slots.shape
+    fig, axes = plt.subplots(1, S, figsize=(max(S * 2, 6), 3))
+    if S == 1:
+        axes = [axes]
+
+    fig.suptitle(
+        f"Context strip  |  Epoch {epoch}  |  Sample {sample_idx}  "
+        f"({num_context} valid context + 1 target)",
+        fontsize=9,
+        fontweight="bold",
+    )
+
+    first_valid = S - 1 - num_context
+
+    for slot_i, ax in enumerate(axes):
+        ax.imshow(context_slots[slot_i], **_SPEC_KW)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        if slot_i == S - 1:
+            label, color = "TARGET", "gold"
+        elif slot_i >= first_valid:
+            label, color = f"ctx {slot_i - first_valid}", "limegreen"
+        else:
+            label, color = "PAD", "tomato"
+
+        ax.set_title(label, fontsize=7, color=color, fontweight="bold")
+        for spine in ax.spines.values():
+            spine.set_edgecolor(color)
+            spine.set_linewidth(2)
+
+    fig.tight_layout()
+    return fig
+
+
+def make_error_histogram_figure(
+    outputs: list,
+    targets: list,
+    epoch: int,
+) -> plt.Figure:
+    """
+    Distribution of per-pixel signed errors across all visualisation samples.
+
+    What to look for:
+      - Centred on 0 = unbiased predictions (good)
+      - Shrinking spread over epochs = the model is learning
+      - Peak at a non-zero value = systematic bias (bad)
+      - All mass at 0 = mode collapse / model always predicts mean
+    """
+    errors = np.concatenate([(o - t).ravel() for o, t in zip(outputs, targets)])
+    mean_e = errors.mean()
+    std_e = errors.std()
+    mae = np.abs(errors).mean()
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.hist(
+        errors, bins=100, range=(-2, 2), color="steelblue", alpha=0.75, density=True
+    )
+    ax.axvline(0, color="black", lw=1.5, ls="--", label="zero")
+    ax.axvline(mean_e, color="tomato", lw=1.5, ls="-", label=f"mean = {mean_e:.4f}")
+    ax.set_title(
+        f"Error distribution  |  Epoch {epoch}  |  "
+        f"μ={mean_e:.4f}  σ={std_e:.4f}  MAE={mae:.4f}",
+        fontsize=10,
+    )
+    ax.set_xlabel("output − target (pixel value)")
+    ax.set_ylabel("density")
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    return fig
+
+
+def make_output_stats_figure(
+    outputs: list,
+    targets: list,
+    epoch: int,
+) -> plt.Figure:
+    """
+    Bar chart: mean / std / min / max of model outputs vs live targets.
+
+    Immediate mode-collapse detector: if output_std << target_std the model
+    is predicting a near-constant spectrogram.
+    """
+
+    def stats(arrs):
+        flat = np.concatenate([a.ravel() for a in arrs])
+        return dict(
+            mean=float(flat.mean()),
+            std=float(flat.std()),
+            min=float(flat.min()),
+            max=float(flat.max()),
+        )
+
+    out_s = stats(outputs)
+    tgt_s = stats(targets)
+    keys = ["mean", "std", "min", "max"]
+    x = np.arange(len(keys))
+    w = 0.35
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.bar(
+        x - w / 2,
+        [out_s[k] for k in keys],
+        w,
+        label="model output",
+        color="steelblue",
+        alpha=0.8,
+    )
+    ax.bar(
+        x + w / 2,
+        [tgt_s[k] for k in keys],
+        w,
+        label="live target",
+        color="darkorange",
+        alpha=0.8,
+    )
+    ax.set_xticks(x)
+    ax.set_xticklabels(keys)
+    ax.axhline(0, color="black", lw=0.8, ls="--")
+    ax.set_title(f"Output vs target pixel statistics  |  Epoch {epoch}", fontsize=10)
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    return fig
 
 
 class LiveifyLightningModule(pl.LightningModule):
@@ -108,60 +312,79 @@ class LiveifyLightningModule(pl.LightningModule):
         model: LiveifyModel,
         learning_rate: float = 1e-4,
         sample_rate: int = 22050,
+        n_mels: int = 256,
+        n_fft: int = 1024,
+        hop_length: int = 512,
         use_augmentation: bool = True,
         aug_freq_mask: int = 20,
         aug_time_mask: int = 40,
-        aug_noise_std: float = 0.01,
+        aug_noise_std: float = 0.02,
+        # ----- vis -----
+        viz_every_n_epochs: int = 5,
+        viz_num_samples: int = 4,
+        viz_log_audio: bool = True,
+        viz_save_local: bool = True,
     ):
         super().__init__()
         self.model = model
         self.learning_rate = learning_rate
         self.sample_rate = sample_rate
+        self.n_mels = n_mels
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.viz_every_n_epochs = viz_every_n_epochs
+        self.viz_num_samples = viz_num_samples
+        self.viz_log_audio = viz_log_audio
+        self.viz_save_local = viz_save_local
 
-        self.loss_fn = SpectrogramLoss(
-            psa_weight=5.0,
-            si_sdr_weight=0,
-            l1_weight=1.0,
-        )
+        # SIMPLIFIED LOSS: L1 + L2 only
+        self.loss_fn = SpectrogramLoss(l1_weight=1.0, l2_weight=1.0)
 
         if use_augmentation:
+            # LESS AGGRESSIVE AUGMENTATION
+            # Reduce masking parameters and apply only 50% of time
             self.augmentation = SpectrogramAugmentation(
                 freq_mask_param=aug_freq_mask,
                 time_mask_param=aug_time_mask,
                 num_freq_masks=2,
                 num_time_masks=2,
                 noise_std=aug_noise_std,
-                p=0.5,
+                p=0.5,  # apply augmentation 50% of the time
             )
         else:
             self.augmentation = None
 
-        self.validation_outputs = []
-        self.saved_input_target = False  # Track if we've saved input/target once
-        self.sample_for_visualization = None  # Store a sample for visualization
+        self._viz_samples: list = []
+        self._viz_inputs_frozen: bool = False
 
         self.save_hyperparameters(ignore=["model"])
 
+    def _batch_to_mel(self, audio: torch.Tensor) -> torch.Tensor:
+        mel = audio_to_mel_tensor(
+            audio,
+            sr=self.sample_rate,
+            n_mels=self.n_mels,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+        )
+        target_f, target_t = self.model.input_fdim, self.model.input_tdim
+
+        if mel.shape[3] < target_f:
+            mel = F.pad(mel, (0, 0, 0, target_f - mel.shape[3]))
+        elif mel.shape[3] > target_f:
+            mel = mel[:, :, :, :target_f, :]
+        if mel.shape[4] < target_t:
+            mel = F.pad(mel, (0, target_t - mel.shape[4]))
+        elif mel.shape[4] > target_t:
+            mel = mel[:, :, :, :, :target_t]
+
+        return mel
+
     def forward(self, x):
-        target_f = self.model.input_fdim
-        target_t = self.model.input_tdim
-
-        if x.shape[2] < target_f:
-            x = F.pad(x, (0, 0, 0, target_f - x.shape[2]))
-        elif x.shape[2] > target_f:
-            x = x[:, :, :target_f, :]
-
-        if x.shape[3] < target_t:
-            x = F.pad(x, (0, target_t - x.shape[3]))
-        elif x.shape[3] > target_t:
-            x = x[:, :, :, :target_t]
-
         return self.model(x)
 
-    def compute_loss(self, pred, target):
-        """Compute spectrogram reconstruction loss.
-        Pads/crops target to match pred shape (model may change dimensions due to patching).
-        """
+    def compute_loss(self, pred, target_slots):
+        target = target_slots[:, -1]
         if target.shape != pred.shape:
             _, _, pf, pt = pred.shape
             if target.shape[2] < pf:
@@ -172,70 +395,115 @@ class LiveifyLightningModule(pl.LightningModule):
                 target = F.pad(target, (0, pt - target.shape[3]))
             elif target.shape[3] > pt:
                 target = target[:, :, :, :pt]
-
-        loss = self.loss_fn(pred, target)
-        return loss
-
-    def _prepare_batch(self, x, y):
-        """
-        Prepare batch by concatenating context segments along the time axis.
-
-        Returns:
-            x: (B, 1, F, Ctx*T) - context segments concatenated in time
-            y: (B, 1, F, Ctx*T) - context segments concatenated in time
-            B: original batch size
-            Ctx: context length
-        """
-        if x.dim() == 3:
-            # (B, F, T) -> (B, 1, F, T)
-            return x.unsqueeze(1), y.unsqueeze(1), x.shape[0], 1
-        elif x.dim() == 4:
-            # (B, Ctx, F, T) -> (B, 1, F, Ctx*T)
-            B, Ctx, F, T = x.shape
-            x = x.permute(0, 2, 1, 3).contiguous().view(B, 1, F, Ctx * T)
-            y = y.permute(0, 2, 1, 3).contiguous().view(B, 1, F, Ctx * T)
-            return x, y, B, Ctx
-        else:
-            raise ValueError(f"Unexpected input dim: {x.dim()}")
+        return self.loss_fn(pred, target)
 
     def training_step(self, batch, batch_idx):
-        x, y = batch  # studio (input), live (target)
-        x, y, B, Ctx = self._prepare_batch(x, y)
+        studio_audio = batch["studio_audio"]
+        live_audio = batch["live_audio"]
+
+        x = self._batch_to_mel(studio_audio)
+        y = self._batch_to_mel(live_audio)
 
         if self.augmentation is not None:
-            x = self.augmentation(x)
+            B, S, C, F, T = x.shape
+            x_flat = x.view(B * S, C, F, T)
+            x_flat = self.augmentation(x_flat)
+            x = x_flat.view(B, S, C, F, T)
 
         y_pred = self(x)
-
         loss = self.compute_loss(y_pred, y)
 
-        current_lr = self.optimizers().param_groups[0]["lr"]
-        self.log("train/lr", current_lr, prog_bar=True)
+        lr = self.optimizers().param_groups[0]["lr"]
+        self.log("train/lr", lr, prog_bar=True)
         self.log("train/loss", loss, prog_bar=True)
 
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x, y = batch
-        x, y, B, Ctx = self._prepare_batch(x, y)
+        studio_audio = batch["studio_audio"]
+        live_audio = batch["live_audio"]
 
+        x = self._batch_to_mel(studio_audio)
+        y = self._batch_to_mel(live_audio)
         y_pred = self(x)
-
         loss = self.compute_loss(y_pred, y)
 
         self.log("val/loss", loss, prog_bar=True)
 
-        if batch_idx == 0 and self.sample_for_visualization is None:
-            self.sample_for_visualization = {
-                "input": x[0:1].detach().cpu(),
-                "target": y[0:1].detach().cpu(),
-            }
+        B = x.shape[0]
+        for b in range(B):
+            global_idx = batch_idx * B + b
+            if global_idx >= self.viz_num_samples:
+                break
 
-        if batch_idx == 0:
-            if self.sample_for_visualization is not None:
-                self.sample_for_visualization["output"] = y_pred[0:1].detach().cpu()
+            out_np = y_pred[b, 0].detach().cpu().float().numpy()  # (F, T)
+
+            if not self._viz_inputs_frozen:
+                self._viz_samples.append(
+                    {
+                        "studio": x[b, -1, 0].detach().cpu().float().numpy(),  # (F, T)
+                        "target": y[b, -1, 0].detach().cpu().float().numpy(),  # (F, T)
+                        "context_all": x[b, :, 0]
+                        .detach()
+                        .cpu()
+                        .float()
+                        .numpy(),  # (S, F, T)
+                        "num_context": int(batch["num_context"][b].item()),
+                        "output": out_np,
+                    }
+                )
+            elif global_idx < len(self._viz_samples):
+                self._viz_samples[global_idx]["output"] = out_np
 
         return loss
+
+    def _emit_figure(
+        self, fig: plt.Figure, tag: str, epoch: int, is_wandb: bool
+    ) -> None:
+        if is_wandb:
+            import wandb
+
+            self.logger.experiment.log({tag: wandb.Image(fig)}, step=self.global_step)
+        else:
+            img = _fig_to_numpy(fig)  # (H, W, 3) uint8
+            img_t = torch.from_numpy(img).permute(2, 0, 1)  # (3, H, W)
+            self.logger.experiment.add_image(tag, img_t, global_step=epoch)
+
+        if self.viz_save_local:
+            out_dir = Path("./spectrograms") / f"epoch_{epoch:04d}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            safe = tag.replace("/", "_")
+            fig.savefig(out_dir / f"{safe}.png", dpi=120, bbox_inches="tight")
+
+        plt.close(fig)
+
+    def _log_audio_wandb(self, epoch: int) -> None:
+        """
+        Invert mel spectrograms with Griffin-Lim and log as playable W&B audio.
+        Lets you hear: does the output sound like the live recording or the studio?
+        """
+        import wandb
+
+        audio_logs = {}
+        for i, s in enumerate(self._viz_samples):
+            for role in ("studio", "output", "target"):
+                try:
+                    wav = mel_to_audio_griffin_lim(
+                        s[role],
+                        sr=self.sample_rate,
+                        n_fft=self.n_fft,
+                        hop_length=self.hop_length,
+                    )
+                    audio_logs[f"viz/audio/sample_{i}/{role}"] = wandb.Audio(
+                        wav,
+                        sample_rate=self.sample_rate,
+                        caption=f"Epoch {epoch} | sample {i} | {role}",
+                    )
+                except Exception as e:
+                    print(f"[audio] Griffin-Lim failed: sample {i} / {role}: {e}")
+
+        if audio_logs:
+            self.logger.experiment.log(audio_logs, step=self.global_step)
 
     def on_before_optimizer_step(self, optimizer):
         if self.global_step % 10 == 0:
@@ -246,56 +514,6 @@ class LiveifyLightningModule(pl.LightningModule):
             )
             self.log("train/grad_norm", total_norm, on_step=True, on_epoch=False)
 
-    def on_validation_epoch_end(self):
-        """Save spectrograms every 10 epochs."""
-        if self.sample_for_visualization is None:
-            return
-
-        current_epoch = self.current_epoch
-
-        if not self.saved_input_target:
-            self._save_spectrogram(
-                self.sample_for_visualization["input"][0, 0].numpy(),
-                "input_studio",
-                "Studio Recording (Input)",
-            )
-            self._save_spectrogram(
-                self.sample_for_visualization["target"][0, 0].numpy(),
-                "target_live",
-                "Live Recording (Target)",
-            )
-            self.saved_input_target = True
-
-        if current_epoch % 10 == 0 and "output" in self.sample_for_visualization:
-            self._save_spectrogram(
-                self.sample_for_visualization["output"][0, 0].float().numpy(),
-                f"output_epoch_{current_epoch:04d}",
-                f"Model Prediction - Epoch {current_epoch}",
-            )
-
-    def _save_spectrogram(self, spec, filename, title):
-        """Save a single spectrogram to file."""
-        output_dir = Path("./spectrograms")
-        output_dir.mkdir(exist_ok=True)
-
-        fig, ax = plt.subplots(figsize=(12, 4))
-
-        im = ax.imshow(
-            spec, aspect="auto", origin="lower", cmap="viridis", vmin=-1, vmax=1
-        )
-        ax.set_title(title, fontsize=12, fontweight="bold")
-        ax.set_ylabel("Mel Frequency Bin")
-        ax.set_xlabel("Time Frame")
-        plt.colorbar(im, ax=ax, label="Normalized Magnitude")
-
-        plt.tight_layout()
-
-        save_path = output_dir / f"{filename}.png"
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-
-        print(f"Saved spectrogram: {save_path}")
-
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
             self.parameters(),
@@ -303,15 +521,13 @@ class LiveifyLightningModule(pl.LightningModule):
             betas=(0.9, 0.98),
             weight_decay=1e-3,
         )
-
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="min",
             factor=0.5,
-            patience=300,
+            patience=120,
             min_lr=1e-8,
         )
-
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -323,50 +539,51 @@ class LiveifyLightningModule(pl.LightningModule):
 
 
 def train(args=None):
-    """Main training function."""
-
     if args is None:
         args = parse_args()
-
-    learning_rate = args.learning_rate
-    batch_size = args.batch_size
-    max_epochs = args.max_epochs
 
     pl.seed_everything(42)
 
     datamodule = StudioLiveDataModule(
         studio_dir=args.studio_dir,
         live_dir=args.live_dir,
-        batch_size=batch_size,
+        batch_size=args.batch_size,
         sr=args.sample_rate,
         segment_duration=args.segment_duration,
         context_length=args.context_length,
         train_split=args.train_split,
-        persistent_workers=True,
         num_workers=args.num_workers,
-        development_mode=args.development_mode,
     )
 
+    hop_length = 512
     time_frames_per_segment = int(
-        (args.sample_rate * args.segment_duration) / 512
-    )  # 22050 * 0.5 / 512 = ~22 frames per segment with hop_length=512
+        (args.sample_rate * args.segment_duration) / hop_length
+    )
     patch_size = args.patch_size
 
-    total_time_frames = time_frames_per_segment * args.context_length
-    input_tdim = (total_time_frames // patch_size) * patch_size
+    input_tdim = (time_frames_per_segment // patch_size) * patch_size
     if input_tdim < patch_size:
         input_tdim = patch_size
 
-    print(f"Spectrogram config:")
-    print(f"  Frames per segment: {time_frames_per_segment}")
-    print(f"  Context length: {args.context_length}")
-    print(f"  Total time frames: {total_time_frames} -> input_tdim: {input_tdim}")
+    print("Spectrogram config:")
+    print(f"  Frames/segment : {time_frames_per_segment} -> input_tdim: {input_tdim}")
     print(
-        f"  Patches: {256 // patch_size} freq x {input_tdim // patch_size} time = {(256 // patch_size) * (input_tdim // patch_size)} total"
+        f"  Context length : {args.context_length} past + 1 current = {args.context_length+1} slots"
+    )
+    print(
+        f"  Patches/slot   : {args.n_mels//patch_size} freq x {input_tdim//patch_size} time"
+        f" = {(args.n_mels//patch_size)*(input_tdim//patch_size)}"
+    )
+    print(
+        f"  Transformer tokens: "
+        f"{(args.n_mels//patch_size)*(input_tdim//patch_size)*(args.context_length+1)} + 1 cls"
+    )
+    print(
+        f"  Viz: every {args.viz_every_n_epochs} epochs, {args.viz_num_samples} samples"
     )
 
     model = LiveifyModel(
-        input_fdim=256,  # n_mels from dataset
+        input_fdim=args.n_mels,
         input_tdim=input_tdim,
         patch_size=(patch_size, patch_size),
         embed_dim=args.embed_dim,
@@ -377,16 +594,24 @@ def train(args=None):
         attention_dropout=args.attention_dropout,
         in_channels=1,
         out_channels=1,
+        context_length=args.context_length,
     )
 
     lightning_module = LiveifyLightningModule(
         model=model,
-        learning_rate=learning_rate,
+        learning_rate=args.learning_rate,
         sample_rate=args.sample_rate,
+        n_mels=args.n_mels,
+        n_fft=args.n_fft,
+        hop_length=hop_length,
         use_augmentation=args.use_augmentation,
         aug_freq_mask=args.aug_freq_mask,
         aug_time_mask=args.aug_time_mask,
         aug_noise_std=args.aug_noise_std,
+        viz_every_n_epochs=args.viz_every_n_epochs,
+        viz_num_samples=args.viz_num_samples,
+        viz_log_audio=args.viz_log_audio,
+        viz_save_local=args.viz_save_local,
     )
 
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -403,215 +628,157 @@ def train(args=None):
         save_last=True,
     )
 
-    # early_stop_callback = EarlyStopping(
-    #     monitor="val/loss",
-    #     patience=args.patience,
-    #     mode="min",
-    #     verbose=True,
-    # )
-
     if args.logger == "wandb":
         logger = WandbLogger(
-            project="liveify",
+            project=args.wandb_project,
+            name=args.wandb_run_name or None,
             save_dir=args.log_dir,
             log_model=False,
         )
     else:
-        logger = TensorBoardLogger(
-            save_dir=args.log_dir,
-            name="liveify",
-        )
+        logger = TensorBoardLogger(save_dir=args.log_dir, name="liveify")
 
     trainer = pl.Trainer(
-        max_epochs=max_epochs,
+        max_epochs=args.max_epochs,
         accelerator="auto",
         devices=1,
         precision=args.precision,
         callbacks=[checkpoint_callback],
         logger=logger,
-        log_every_n_steps=1,
+        log_every_n_steps=10,  # Reduced from 1 to cut wandb overhead
         gradient_clip_val=1,
         gradient_clip_algorithm="norm",
         accumulate_grad_batches=args.accumulate_grad_batches,
     )
 
     print("\n" + "=" * 50)
-    if args.resume_from:
-        print(f"Resuming training from: {args.resume_from}")
-    else:
-        print("Starting training...")
+    print(
+        f"Resuming from: {args.resume_from}"
+        if args.resume_from
+        else "Starting training..."
+    )
     print("=" * 50 + "\n")
 
     trainer.fit(lightning_module, datamodule, ckpt_path=args.resume_from)
 
     print("\n" + "=" * 50)
-    print("Training completed!")
-    print(f"Best model checkpoint: {checkpoint_callback.best_model_path}")
+    print("Training complete!")
+    print(f"Best checkpoint: {checkpoint_callback.best_model_path}")
     print("=" * 50 + "\n")
+
+
+# ===== Args ======
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Liveify model")
 
-    parser.add_argument(
-        "--studio_dir",
-        type=str,
-        default="./dataset/studio",
-        help="Path to studio recordings",
-    )
-    parser.add_argument(
-        "--live_dir", type=str, default="./dataset/live", help="Path to live recordings"
-    )
-    parser.add_argument(
-        "--sample_rate", type=int, default=22050, help="Audio sample rate"
-    )
-    parser.add_argument(
-        "--segment_duration",
-        type=float,
-        default=0.5,
-        help="Segment duration in seconds (aligned at 5s, chopped to this)",
-    )
-    parser.add_argument(
-        "--context_length",
-        type=int,
-        default=64,
-        help="Number of consecutive segments concatenated along time axis for temporal context",
-    )
-    parser.add_argument(
-        "--train_split", type=float, default=0.8, help="Train/val split ratio"
-    )
+    # data
+    parser.add_argument("--studio_dir", type=str, default="./datasetv2/studio")
+    parser.add_argument("--live_dir", type=str, default="./datasetv2/live")
+    parser.add_argument("--sample_rate", type=int, default=22050)
+    parser.add_argument("--segment_duration", type=float, default=1.0)
+    parser.add_argument("--context_length", type=int, default=8)
+    parser.add_argument("--train_split", type=float, default=0.8)
 
+    # training
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument(
-        "--batch_size", type=int, default=8, help="Batch size for training"
-    )
-    parser.add_argument(
-        "--learning_rate", type=float, default=1e-6, help="Learning rate"
-    )
-    parser.add_argument(
-        "--max_epochs", type=int, default=100, help="Maximum number of epochs"
-    )
-    parser.add_argument(
-        "--patience", type=int, default=1000, help="Early stopping patience"
-    )
-    parser.add_argument(
-        "--num_workers", type=int, default=10, help="Number of dataloader workers"
-    )
-    parser.add_argument(
-        "--accumulate_grad_batches",
-        type=int,
-        default=1,
-        help="Gradient accumulation steps",
-    )
+        "--learning_rate", type=float, default=3e-4
+    )  # was 1e-5 - increased for small dataset
+    parser.add_argument("--max_epochs", type=int, default=-1)
+    parser.add_argument("--patience", type=int, default=1000)
+    parser.add_argument("--num_workers", type=int, default=10)
+    parser.add_argument("--accumulate_grad_batches", type=int, default=1)
     parser.add_argument(
         "--precision",
         type=str,
         default="bf16-mixed",
         choices=["32", "16", "bf16", "16-mixed", "bf16-mixed"],
-        help="Training precision",
     )
 
-    parser.add_argument(
-        "--embed_dim",
-        type=int,
-        default=512,
-        help="Embedding dimension for transformer",
-    )
-    parser.add_argument(
-        "--num_transformer_layers",
-        type=int,
-        default=4,
-        help="Number of transformer encoder layers",
-    )
-    parser.add_argument(
-        "--num_heads",
-        type=int,
-        default=4,
-        help="Number of attention heads",
-    )
-    parser.add_argument(
-        "--mlp_ratio",
-        type=float,
-        default=4.0,
-        help="MLP hidden dimension ratio",
-    )
-    parser.add_argument(
-        "--dropout",
-        type=float,
-        default=0.3,
-        help="Dropout rate",
-    )
-    parser.add_argument(
-        "--attention_dropout",
-        type=float,
-        default=0.3,
-        help="Attention dropout rate",
-    )
-    parser.add_argument(
-        "--patch_size",
-        type=int,
-        default=16,
-        help="Patch size for Vision Transformer",
-    )
+    # spectrogram
+    parser.add_argument("--n_mels", type=int, default=128)
+    parser.add_argument("--n_fft", type=int, default=2048)
 
+    # model - REDUCED FOR SMALL DATASET
+    parser.add_argument("--embed_dim", type=int, default=256)  # was 512
+    parser.add_argument("--num_transformer_layers", type=int, default=2)  # was 4
+    parser.add_argument("--num_heads", type=int, default=2)  # was 4
+    parser.add_argument("--mlp_ratio", type=float, default=4.0)
+    parser.add_argument("--dropout", type=float, default=0.1)  # was 0.3
+    parser.add_argument("--attention_dropout", type=float, default=0.1)  # was 0.3
+    parser.add_argument("--patch_size", type=int, default=16)
+
+    # augmentation - LESS AGGRESSIVE FOR SMALL DATASET
+    parser.add_argument("--use_augmentation", action="store_true", default=True)
     parser.add_argument(
-        "--use_augmentation",
+        "--no_augmentation", dest="use_augmentation", action="store_false"
+    )
+    parser.add_argument(
+        "--aug_freq_mask", type=int, default=10
+    )  # was 20 - reduced masking
+    parser.add_argument(
+        "--aug_time_mask", type=int, default=20
+    )  # was 40 - reduced masking
+    parser.add_argument(
+        "--aug_noise_std", type=float, default=0.02
+    )  # was 0.1 - less noise
+
+    # visualisation
+    parser.add_argument(
+        "--viz_every_n_epochs",
+        type=int,
+        default=1,
+        help="Generate full visualisation panels every N epochs.",
+    )
+    parser.add_argument(
+        "--viz_num_samples",
+        type=int,
+        default=4,
+        help="Number of fixed validation examples to track and visualise.",
+    )
+    parser.add_argument(
+        "--viz_log_audio",
         action="store_true",
         default=True,
-        help="Use data augmentation during training",
+        help="Upload Griffin-Lim audio to W&B so you can actually listen to outputs.",
     )
     parser.add_argument(
-        "--no_augmentation",
-        dest="use_augmentation",
-        action="store_false",
-        help="Disable data augmentation",
+        "--no_viz_log_audio", dest="viz_log_audio", action="store_false"
     )
     parser.add_argument(
-        "--aug_freq_mask",
-        type=int,
-        default=20,
-        help="Maximum frequency mask width for SpecAugment",
+        "--viz_save_local",
+        action="store_true",
+        default=True,
+        help="Save visualisation PNGs to ./spectrograms/epoch_XXXX/.",
     )
     parser.add_argument(
-        "--aug_time_mask",
-        type=int,
-        default=40,
-        help="Maximum time mask width for SpecAugment",
-    )
-    parser.add_argument(
-        "--aug_noise_std",
-        type=float,
-        default=0.01,
-        help="Standard deviation of Gaussian noise to add",
+        "--no_viz_save_local", dest="viz_save_local", action="store_false"
     )
 
-    parser.add_argument(
-        "--checkpoint_dir",
-        type=str,
-        default="./checkpoints",
-        help="Directory to save checkpoints",
-    )
-    parser.add_argument(
-        "--log_dir", type=str, default="./logs", help="Directory to save logs"
-    )
+    # logging
+    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints")
+    parser.add_argument("--log_dir", type=str, default="./logs")
     parser.add_argument(
         "--logger",
         type=str,
         default="tensorboard",
         choices=["tensorboard", "wandb"],
-        help="Logger to use for experiment tracking",
-    )
-
-    parser.add_argument(
-        "--development_mode",
-        action="store_true",
-        help="Use only first song pair for fast iteration",
     )
     parser.add_argument(
-        "--resume_from",
+        "--wandb_project",
+        type=str,
+        default="liveify",
+        help="W&B project name (--logger wandb only).",
+    )
+    parser.add_argument(
+        "--wandb_run_name",
         type=str,
         default=None,
-        help="Path to checkpoint to resume training from",
+        help="W&B run display name (optional).",
     )
+    parser.add_argument("--resume_from", type=str, default=None)
 
     return parser.parse_args()
 

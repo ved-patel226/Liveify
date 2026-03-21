@@ -13,280 +13,179 @@ import pickle
 import hashlib
 
 
-def lyric_similarity_score(text1: str, text2: str) -> float:
-    """Simple similarity score between two text strings."""
-    text1 = re.sub(r"[^\w\s]", "", text1.lower())
-    text2 = re.sub(r"[^\w\s]", "", text2.lower())
-    return SequenceMatcher(None, text1, text2).ratio()
+def _align_pair_worker(args):
+    """Module-level function for multiprocessing (must be pickleable)."""
+    paths, pair_data, sr = args
+    # Recreate the alignment logic here
+    hop_length = 512
+
+    studio_audio = pair_data["studio_audio"]
+    live_audio = pair_data["live_audio"]
+
+    studio_chroma = librosa.feature.chroma_cqt(
+        y=studio_audio, sr=sr, hop_length=hop_length
+    )
+    live_chroma = librosa.feature.chroma_cqt(y=live_audio, sr=sr, hop_length=hop_length)
+
+    _, wp = librosa.sequence.dtw(X=live_chroma, Y=studio_chroma, metric="cosine")
+
+    studio_start_frame = wp[-1, 1]
+    studio_start_sample = studio_start_frame * hop_length
+    end_sample = studio_start_sample + len(live_audio)
+    cropped_studio = studio_audio[studio_start_sample:end_sample]
+
+    return paths, cropped_studio
 
 
 class StudioLiveDataset(Dataset):
+    __version__ = "0.1.0"
+
     def __init__(
         self,
-        studio_dir: str,
-        live_dir: str,
-        sr: int = 22050,
-        segment_duration: float = 0.5,
-        context_length: int = 16,
-        development_mode: bool = False,
-        min_lyric_similarity: float = 0.3,
-        n_mels: int = 256,
-        cache_dir: str = "./cache",
+        studio_dir,
+        live_dir,
+        segment_duration=5.0,
+        num_segments=5,
+        lyric_match_threshold=0.5,
+        context_length=16,
+        sr=22050,
     ):
-        """
-        Dataset for paired studio/live audio aligned via lyrics.
-
-        Args:
-            studio_dir: Path to studio recordings
-            live_dir: Path to live recordings
-            sr: Sample rate
-            segment_duration: Duration of each segment in seconds
-            context_length: Number of consecutive segments per sample
-            development_mode: If True, only load first pair
-            min_lyric_similarity: Minimum similarity to keep segment
-            n_mels: Number of mel bins
-            cache_dir: Cache directory
-        """
+        """Dataset pairs `studio`/`live` audio files."""
         self.studio_dir = studio_dir
         self.live_dir = live_dir
-        self.sr = sr
-        self.segment_length = int(segment_duration * sr)
+        self.segment_duration = segment_duration
+        self.num_segments = num_segments
+        self.segment_samples = int(segment_duration * sr)
+        self.lyric_match_threshold = lyric_match_threshold
         self.context_length = context_length
-        self.min_lyric_similarity = min_lyric_similarity
-        self.n_mels = n_mels
-        self.cache_dir = cache_dir
-        self.development_mode = development_mode
+        self.sr = sr
 
-        self.whisper_model = None
-        self.pairs = self._load_or_create_segments()
+        self.has_gpu = torch.cuda.is_available()
 
-    def _get_cache_path(self) -> str:
-        """Generate cache file path."""
-        config = f"{self.studio_dir}_{self.live_dir}_{self.sr}_{self.segment_length}_{self.min_lyric_similarity}_{self.development_mode}_{self.n_mels}_v2"
-        cache_key = hashlib.md5(config.encode()).hexdigest()
-        os.makedirs(self.cache_dir, exist_ok=True)
-        return os.path.join(self.cache_dir, f"segments_{cache_key}.pkl")
+        studio_files = sorted(os.listdir(self.studio_dir))
+        live_files = sorted(os.listdir(self.live_dir))
 
-    def _load_or_create_segments(self) -> List[dict]:
-        """Load from cache or create new segments."""
-        cache_path = self._get_cache_path()
+        # keep pairs as list of tuples so we can use them as dict keys
+        self.pairs = [
+            (os.path.join(self.studio_dir, sf), os.path.join(self.live_dir, lf))
+            for sf, lf in zip(studio_files, live_files)
+            if sf == lf
+        ]
 
-        if os.path.exists(cache_path):
+        unmatched_studio = set(studio_files) - set(live_files)
+        unmatched_live = set(live_files) - set(studio_files)
+        if unmatched_studio:
+            print(f"Warning: Studio files with no pairs: {list(unmatched_studio)}")
+        if unmatched_live:
+            print(f"Warning: Live files with no pairs: {list(unmatched_live)}")
+
+        self.pairs_cache = {}
+        self._get_local_cache_audio()
+        self._align_cache_audio()
+
+        if self.pairs_cache:
+            min_samples = min(len(v["live_audio"]) for v in self.pairs_cache.values())
+            self._segments_per_song = max(1, min_samples // self.segment_samples)
+        else:
+            self._segments_per_song = 0
+
+        print(self.pairs_cache)
+
+    def _get_local_cache_audio(self):
+        for studio_path, live_path in self.pairs:
             try:
-                print(f"Loading from cache: {cache_path}")
-                with open(cache_path, "rb") as f:
-                    return pickle.load(f)
-            except Exception as e:
-                print(f"Cache load failed: {e}")
-
-        segments = self._create_segments()
-
-        try:
-            with open(cache_path, "wb") as f:
-                pickle.dump(segments, f)
-            print(f"Saved to cache: {cache_path}")
-        except Exception as e:
-            print(f"Cache save failed: {e}")
-
-        return segments
-
-    def _audio_to_mel(self, audio: np.ndarray) -> np.ndarray:
-        """Convert audio to normalized mel spectrogram."""
-        mel = librosa.feature.melspectrogram(
-            y=audio,
-            sr=self.sr,
-            n_fft=2048,
-            hop_length=512,
-            n_mels=self.n_mels,
-            fmin=20,
-            fmax=8000,
-        )
-        mel_db = librosa.power_to_db(mel, ref=1.0)
-        mel_db = np.clip(mel_db, -80.0, 20.0)
-        mel_norm = 2.0 * (mel_db + 80.0) / 100.0 - 1.0
-        return mel_norm
-
-    def _create_segments(self) -> List[dict]:
-        """Create all segments from audio pairs."""
-        if self.whisper_model is None:
-            print("Loading Whisper model...")
-            self.whisper_model = whisper.load_model("small")
-
-        studio_files = sorted(
-            [f for f in os.listdir(self.studio_dir) if f.endswith((".mp3", ".wav"))]
-        )
-        live_files = sorted(
-            [f for f in os.listdir(self.live_dir) if f.endswith((".mp3", ".wav"))]
-        )
-
-        pairs = []
-        for sf in studio_files:
-            for lf in live_files:
-                if os.path.splitext(sf)[0].lower() in os.path.splitext(lf)[0].lower():
-                    pairs.append((sf, lf))
-
-        if self.development_mode:
-            pairs = pairs[:1]
-
-        all_segments = []
-        print(f"Processing {len(pairs)} pairs...")
-
-        for studio_file, live_file in tqdm(pairs):
-            segments = self._process_pair(studio_file, live_file)
-            all_segments.extend(segments)
-
-        print(f"Created {len(all_segments)} segments")
-        return all_segments
-
-    def _process_pair(self, studio_file: str, live_file: str) -> List[dict]:
-        """Process a single audio pair - maintains temporal order."""
-        studio_path = os.path.join(self.studio_dir, studio_file)
-        live_path = os.path.join(self.live_dir, live_file)
-
-        studio_audio, _ = librosa.load(studio_path, sr=self.sr)
-        live_audio, _ = librosa.load(live_path, sr=self.sr)
-
-        try:
-            studio_trans = self.whisper_model.transcribe(
-                studio_path, language="en", fp16=False, verbose=False
-            )
-            live_trans = self.whisper_model.transcribe(
-                live_path, language="en", fp16=False, verbose=False
-            )
-        except Exception as e:
-            print(f"Transcription failed for {studio_file}: {e}")
-            return []
-
-        segment_matches = []
-        for studio_seg in studio_trans.get("segments", []):
-            studio_text = studio_seg.get("text", "").strip()
-            best_score = 0.0
-            best_live_seg = None
-
-            for live_seg in live_trans.get("segments", []):
-                live_text = live_seg.get("text", "").strip()
-                score = lyric_similarity_score(studio_text, live_text)
-                if score > best_score:
-                    best_score = score
-                    best_live_seg = live_seg
-
-            if best_live_seg and best_score >= self.min_lyric_similarity:
-                segment_matches.append(
-                    {
-                        "studio_start": studio_seg["start"],
-                        "studio_end": studio_seg["end"],
-                        "live_start": best_live_seg["start"],
-                        "live_end": best_live_seg["end"],
-                        "similarity": best_score,
-                    }
-                )
-
-        segments = []
-        for match in segment_matches:
-            studio_clip = self._extract_clip(
-                studio_audio, match["studio_start"], match["studio_end"]
-            )
-            live_clip = self._extract_clip(
-                live_audio, match["live_start"], match["live_end"]
-            )
-
-            min_len = min(len(studio_clip), len(live_clip))
-            studio_clip = studio_clip[:min_len]
-            live_clip = live_clip[:min_len]
-
-            num_segments = min_len // self.segment_length
-
-            for i in range(num_segments):
-                start = i * self.segment_length
-                end = start + self.segment_length
-
-                studio_seg_audio = studio_clip[start:end]
-                live_seg_audio = live_clip[start:end]
-
-                seg_dict = {
-                    "studio_spec": self._audio_to_mel(studio_seg_audio),
-                    "live_spec": self._audio_to_mel(live_seg_audio),
-                    "studio_name": studio_file,
-                    "live_name": live_file,
-                    "similarity": match["similarity"],
-                    "timestamp": match["studio_start"]
-                    + (i * self.segment_length / self.sr),
-                    "studio_audio": studio_seg_audio,
-                    "live_audio": live_seg_audio,
+                studio_audio, _ = librosa.load(studio_path, sr=self.sr, mono=True)
+                live_audio, _ = librosa.load(live_path, sr=self.sr, mono=True)
+                self.pairs_cache[(studio_path, live_path)] = {
+                    "studio_audio": studio_audio,
+                    "live_audio": live_audio,
                 }
+            except Exception as e:
+                print(f"Error loading {studio_path} or {live_path}: {e}")
+                continue
 
-                segments.append(seg_dict)
+    def _align_cache_audio(self):
+        """Align audio pairs using DTW. Can be parallelized for faster initialization."""
+        from multiprocessing import Pool
 
-        return segments
+        # Prepare arguments for worker function
+        items = [
+            (paths, pair_data, self.sr) for paths, pair_data in self.pairs_cache.items()
+        ]
 
-    def _extract_clip(self, audio: np.ndarray, start: float, end: float) -> np.ndarray:
-        """Extract audio clip from timestamps."""
-        start_sample = int(start * self.sr)
-        end_sample = int(end * self.sr)
-        return audio[max(0, start_sample) : min(len(audio), end_sample)]
+        # Use 4 processes for DTW alignment (faster than serial)
+        with Pool(processes=4) as pool:
+            results = pool.imap_unordered(_align_pair_worker, items, chunksize=1)
+            for paths, aligned_studio in tqdm(
+                results, total=len(items), desc="Aligning audio pairs"
+            ):
+                self.pairs_cache[paths]["studio_audio"] = aligned_studio
 
-    def _build_windows(self) -> List[List[Optional[int]]]:
-        """Build context windows with padding - maintains temporal continuity."""
-        if self.context_length <= 1:
-            return [[i] for i in range(len(self.pairs))]
+    def _align_audio(self, studio_audio, live_audio, **kwargs):
+        """Crop studio_audio to match live_audio using DTW on chroma features.
+        No padding; returns cropped studio and original live audio.
+        """
+        hop_length = 512  # TODO: make this a parameter
 
-        groups = {}
-        for i, pair in enumerate(self.pairs):
-            key = (pair["studio_name"], pair["live_name"])
-            groups.setdefault(key, []).append(i)
+        studio_chroma = librosa.feature.chroma_cqt(
+            y=studio_audio, sr=self.sr, hop_length=hop_length
+        )
+        live_chroma = librosa.feature.chroma_cqt(
+            y=live_audio, sr=self.sr, hop_length=hop_length
+        )
 
-        for key in groups:
-            groups[key].sort(key=lambda i: self.pairs[i]["timestamp"])
+        # dtw distance and path
+        _, wp = librosa.sequence.dtw(X=live_chroma, Y=studio_chroma, metric="cosine")
 
-        windows = []
-        for song_key, indices in groups.items():
-            for i in range(len(indices)):
-                window = []
-                padding_needed = max(0, self.context_length - 1 - i)
-                window.extend([None] * padding_needed)
-                start = max(0, i - (self.context_length - 1))
-                window.extend(indices[start : i + 1])
-                windows.append(window)
+        studio_start_frame = wp[-1, 1]
+        studio_start_sample = studio_start_frame * hop_length
+        end_sample = studio_start_sample + len(live_audio)
+        cropped_studio = studio_audio[studio_start_sample:end_sample]
 
-        num_padded = sum(None in w for w in windows)
-        print(f"Built {len(windows)} windows ({num_padded} with padding)")
-        return windows
+        return cropped_studio, live_audio
 
-    def __len__(self) -> int:
-        if not hasattr(self, "_windows"):
-            self._windows = self._build_windows()
-        return len(self._windows)
+    def _calculate_text_similarity(self, text1, text2):
+        if not text1 and not text2:
+            return 1.0
+        if not text1 or not text2:
+            return 0.0
+        return SequenceMatcher(None, text1, text2).ratio()
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get a window of spectrograms."""
-        if not hasattr(self, "_windows"):
-            self._windows = self._build_windows()
+    def __len__(self):
+        return len(self.pairs) * self._segments_per_song
 
-        window = self._windows[idx]
+    def __getitem__(self, idx):
+        song_idx = idx // self._segments_per_song
+        target_segment = idx % self._segments_per_song
 
-        if self.context_length <= 1:
-            pair = self.pairs[window[0]]
-            x = torch.from_numpy(pair["studio_spec"]).float()
-            y = torch.from_numpy(pair["live_spec"]).float()
-            return x, y
+        studio_path, live_path = self.pairs[song_idx]
+        audio_dict = self.pairs_cache[(studio_path, live_path)]
 
-        studio_specs = []
-        live_specs = []
+        context_start = max(0, target_segment - self.context_length)
+        num_context = (
+            target_segment - context_start
+        )  # how many real context segments exist
 
-        silent_shape = self.pairs[0]["studio_spec"].shape
-        silent_spec = np.full(silent_shape, -1.0)
+        # pre-allocate with zeros
+        studio_out = np.zeros((self.context_length + 1, self.segment_samples))
+        live_out = np.zeros((self.context_length + 1, self.segment_samples))
 
-        for pair_idx in window:
-            if pair_idx is None:
-                studio_specs.append(silent_spec)
-                live_specs.append(silent_spec)
-            else:
-                studio_specs.append(self.pairs[pair_idx]["studio_spec"])
-                live_specs.append(self.pairs[pair_idx]["live_spec"])
+        for i, seg_idx in enumerate(range(context_start, target_segment + 1)):
+            s = seg_idx * self.segment_samples
+            e = s + self.segment_samples
+            # right-align: target always at [-1], context fills in from the right
+            slot = (self.context_length - num_context) + i
+            studio_out[slot] = audio_dict["studio_audio"][s:e]
+            live_out[slot] = audio_dict["live_audio"][s:e]
 
-        x = torch.from_numpy(np.stack(studio_specs)).float()
-        y = torch.from_numpy(np.stack(live_specs)).float()
-        return x, y
+        return {
+            "studio_audio": torch.tensor(
+                studio_out, dtype=torch.float32
+            ),  # (context_length+1, segment_samples)
+            "live_audio": torch.tensor(live_out, dtype=torch.float32),
+            "num_context": num_context,
+            "id": live_path,
+        }
 
 
 class StudioLiveDataModule(pl.LightningDataModule):
@@ -296,11 +195,12 @@ class StudioLiveDataModule(pl.LightningDataModule):
         live_dir: str,
         batch_size: int = 8,
         sr: int = 22050,
-        segment_duration: float = 0.5,
+        segment_duration: float = 5.0,
+        num_segments: int = 5,
+        lyric_match_threshold: float = 0.5,
         context_length: int = 16,
         train_split: float = 0.8,
         num_workers: int = 4,
-        development_mode: bool = False,
         **dataset_kwargs,
     ):
         super().__init__()
@@ -309,41 +209,68 @@ class StudioLiveDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.sr = sr
         self.segment_duration = segment_duration
+        self.num_segments = num_segments
+        self.lyric_match_threshold = lyric_match_threshold
         self.context_length = context_length
         self.train_split = train_split
         self.num_workers = num_workers
-        self.development_mode = development_mode
         self.dataset_kwargs = dataset_kwargs
 
     def setup(self, stage: Optional[str] = None):
         full_dataset = StudioLiveDataset(
-            self.studio_dir,
-            self.live_dir,
-            sr=self.sr,
+            studio_dir=self.studio_dir,
+            live_dir=self.live_dir,
             segment_duration=self.segment_duration,
+            num_segments=self.num_segments,
+            lyric_match_threshold=self.lyric_match_threshold,
             context_length=self.context_length,
-            development_mode=self.development_mode,
+            sr=self.sr,
             **self.dataset_kwargs,
         )
 
-        n_total = len(full_dataset)
-        n_train = int(n_total * self.train_split)
-        n_val = n_total - n_train
+        n_songs = len(full_dataset.pairs)
+        n_train_songs = int(n_songs * self.train_split)
 
-        self.train_dataset, self.val_dataset = torch.utils.data.random_split(
-            full_dataset, [n_train, n_val], generator=torch.Generator().manual_seed(42)
+        # split song indices
+        song_indices = list(range(n_songs))
+        train_song_indices = set(song_indices[:n_train_songs])
+
+        # create datasets based on song splits
+        train_indices = [
+            i
+            for i in range(len(full_dataset))
+            if (i // full_dataset._segments_per_song) in train_song_indices
+        ]
+        val_indices = [
+            i
+            for i in range(len(full_dataset))
+            if (i // full_dataset._segments_per_song) not in train_song_indices
+        ]
+
+        self.train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
+        self.val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
+
+        n_train = len(train_indices)
+        n_val = len(val_indices)
+        print(
+            f"Split by songs: {n_train_songs}/{n_songs} songs -> {n_train} train segments, {n_val} val segments"
         )
 
-        print(f"Split: {n_train} train, {n_val} val")
-
     def train_dataloader(self) -> DataLoader:
+        # Reduce workers if dataset is small to avoid overhead
+        effective_workers = (
+            min(self.num_workers, 2)
+            if len(self.train_dataset) < 100
+            else self.num_workers
+        )
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=self.num_workers,
-            persistent_workers=self.num_workers > 0,
+            num_workers=effective_workers,
+            persistent_workers=effective_workers > 0,
             pin_memory=True,
+            prefetch_factor=2 if effective_workers > 0 else None,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -351,8 +278,7 @@ class StudioLiveDataModule(pl.LightningDataModule):
             self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=self.num_workers,
-            persistent_workers=self.num_workers > 0,
+            num_workers=0,  # No shuffling in val, so no workers needed
             pin_memory=True,
         )
 
@@ -364,7 +290,6 @@ if __name__ == "__main__":
         sr=22050,
         segment_duration=0.5,
         context_length=16,
-        development_mode=True,
     )
 
     print(f"Dataset size: {len(dataset)}")
