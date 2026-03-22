@@ -16,16 +16,18 @@ import hashlib
 def _align_pair_worker(args):
     """Module-level function for multiprocessing (must be pickleable)."""
     paths, pair_data, sr = args
-    # Recreate the alignment logic here
     hop_length = 512
 
     studio_audio = pair_data["studio_audio"]
     live_audio = pair_data["live_audio"]
 
-    studio_chroma = librosa.feature.chroma_cqt(
-        y=studio_audio, sr=sr, hop_length=hop_length
+    # + 1e-9 to avoid DTW bitching
+    studio_chroma = (
+        librosa.feature.chroma_cqt(y=studio_audio, sr=sr, hop_length=hop_length) + 1e-9
     )
-    live_chroma = librosa.feature.chroma_cqt(y=live_audio, sr=sr, hop_length=hop_length)
+    live_chroma = (
+        librosa.feature.chroma_cqt(y=live_audio, sr=sr, hop_length=hop_length) + 1e-9
+    )
 
     _, wp = librosa.sequence.dtw(X=live_chroma, Y=studio_chroma, metric="cosine")
 
@@ -48,9 +50,15 @@ class StudioLiveDataset(Dataset):
         num_segments=5,
         lyric_match_threshold=0.5,
         context_length=16,
+        forward_context_length=0,
         sr=22050,
     ):
-        """Dataset pairs `studio`/`live` audio files."""
+        """Dataset pairs `studio`/`live` audio files.
+
+        Args:
+            context_length: Number of past frames (before target)
+            forward_context_length: Number of future frames from studio only (after target)
+        """
         self.studio_dir = studio_dir
         self.live_dir = live_dir
         self.segment_duration = segment_duration
@@ -58,6 +66,7 @@ class StudioLiveDataset(Dataset):
         self.segment_samples = int(segment_duration * sr)
         self.lyric_match_threshold = lyric_match_threshold
         self.context_length = context_length
+        self.forward_context_length = forward_context_length
         self.sr = sr
 
         self.has_gpu = torch.cuda.is_available()
@@ -108,12 +117,11 @@ class StudioLiveDataset(Dataset):
         """Align audio pairs using DTW. Can be parallelized for faster initialization."""
         from multiprocessing import Pool
 
-        # Prepare arguments for worker function
         items = [
             (paths, pair_data, self.sr) for paths, pair_data in self.pairs_cache.items()
         ]
 
-        # Use 4 processes for DTW alignment (faster than serial)
+        # use 4 processes for DTW alignment (faster than serial)
         with Pool(processes=4) as pool:
             results = pool.imap_unordered(_align_pair_worker, items, chunksize=1)
             for paths, aligned_studio in tqdm(
@@ -166,25 +174,44 @@ class StudioLiveDataset(Dataset):
             target_segment - context_start
         )  # how many real context segments exist
 
-        # pre-allocate with zeros
-        studio_out = np.zeros((self.context_length + 1, self.segment_samples))
-        live_out = np.zeros((self.context_length + 1, self.segment_samples))
+        total_slots = self.context_length + self.forward_context_length + 1
 
-        for i, seg_idx in enumerate(range(context_start, target_segment + 1)):
+        studio_out = np.zeros((total_slots, self.segment_samples))
+        live_out = np.zeros((total_slots, self.segment_samples))
+
+        backward_start_slot = self.context_length - num_context
+        for i, seg_idx in enumerate(range(context_start, target_segment)):
+            slot = backward_start_slot + i
             s = seg_idx * self.segment_samples
             e = s + self.segment_samples
-            # right-align: target always at [-1], context fills in from the right
-            slot = (self.context_length - num_context) + i
             studio_out[slot] = audio_dict["studio_audio"][s:e]
             live_out[slot] = audio_dict["live_audio"][s:e]
+
+        studio_audio = audio_dict["studio_audio"]
+        num_samples = len(studio_audio)
+        for fw_idx in range(self.forward_context_length):
+            forward_seg_idx = target_segment + 1 + fw_idx
+            s = forward_seg_idx * self.segment_samples
+            e = s + self.segment_samples
+            if e <= num_samples:
+                slot = self.context_length + fw_idx
+                studio_out[slot] = studio_audio[s:e]
+
+        target_slot = total_slots - 1
+        s = target_segment * self.segment_samples
+        e = s + self.segment_samples
+        studio_out[target_slot] = audio_dict["studio_audio"][s:e]
+        live_out[target_slot] = audio_dict["live_audio"][s:e]
 
         return {
             "studio_audio": torch.tensor(
                 studio_out, dtype=torch.float32
-            ),  # (context_length+1, segment_samples)
+            ),  # (backward_context + forward_context + 1, segment_samples)
             "live_audio": torch.tensor(live_out, dtype=torch.float32),
             "num_context": num_context,
             "id": live_path,
+            "segment_idx": target_segment,
+            "cache_key": f"{live_path}::seg{target_segment}",
         }
 
 
@@ -199,6 +226,7 @@ class StudioLiveDataModule(pl.LightningDataModule):
         num_segments: int = 5,
         lyric_match_threshold: float = 0.5,
         context_length: int = 16,
+        forward_context_length: int = 0,
         train_split: float = 0.8,
         num_workers: int = 4,
         **dataset_kwargs,
@@ -212,6 +240,7 @@ class StudioLiveDataModule(pl.LightningDataModule):
         self.num_segments = num_segments
         self.lyric_match_threshold = lyric_match_threshold
         self.context_length = context_length
+        self.forward_context_length = forward_context_length
         self.train_split = train_split
         self.num_workers = num_workers
         self.dataset_kwargs = dataset_kwargs
@@ -224,6 +253,7 @@ class StudioLiveDataModule(pl.LightningDataModule):
             num_segments=self.num_segments,
             lyric_match_threshold=self.lyric_match_threshold,
             context_length=self.context_length,
+            forward_context_length=self.forward_context_length,
             sr=self.sr,
             **self.dataset_kwargs,
         )
@@ -257,7 +287,6 @@ class StudioLiveDataModule(pl.LightningDataModule):
         )
 
     def train_dataloader(self) -> DataLoader:
-        # Reduce workers if dataset is small to avoid overhead
         effective_workers = (
             min(self.num_workers, 2)
             if len(self.train_dataset) < 100

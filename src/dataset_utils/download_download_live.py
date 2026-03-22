@@ -4,6 +4,8 @@ import yt_dlp
 import ffmpeg
 import os
 
+# ===== DRAKE =====
+
 include_list = {
     "Marvin's Room": {"crop": (0, 0)},
     "Teenage Fever": {"crop": (20, 0)},
@@ -40,6 +42,30 @@ include_list = {
     # "Knife Talk": {"crop": (0.5, 0)},
     "Rich Flex": {"crop": (0, 30)},
     # "Yebba's Heartbreak": {"crop": (0.5, 0)},
+}
+
+# ===== TECCA =====
+
+include_list = {
+    "On Your Own (LIL TECCA COMES OUT)": {"crop": (36, 0)},
+    "Dead Or Alive": {"crop": (0, 60 + 19)},
+    "Fell In Love": {"crop": (0, 13)},
+    "Tic Tac Toe": {"crop": (1, 8)},
+    "Dark Thoughts": {"crop": (15, 51)},
+    "Never Left": {"crop": (5, 32)},
+    # "Did It Again": {"crop": (9, 0)}, Crwd singing
+    "Love Me": {"crop": (5, 8)},
+    # "Diva": {"crop": (0, 0)},
+    # "Malibu's Most Wanted": {"crop": (13, 0)},
+    # "CHOPPA SHOOT THE LOUDEST": {"crop": (1, 0)},
+    "Number 2": {"crop": (1, 15)},
+    "Bad Time": {"crop": (1, 32)},
+    "Down With Me": {"crop": (1, 15)},
+    "OWA OWA": {"crop": (1, 46)},
+    "Half The Plot": {"crop": (29, 60)},
+    "LOT OF ME": {"crop": (0.5, 26)},
+    "Ransom": {"crop": (0, 58)},
+    "500lbs": {"crop": (0, 60 + 56)},
 }
 
 
@@ -85,7 +111,8 @@ def crop_chapter(input_file, start, end, crop_start, crop_end, output_file):
 
 
 if __name__ == "__main__":
-    url = "https://www.youtube.com/watch?v=MGEWtssL4IA"
+    url = "https://www.youtube.com/watch?v=MGEWtssL4IA"  # Drake
+    url = "https://youtu.be/vA3CZNPnnA8?si=au4exBLWYOGQ36ZL"  # Tecca
 
     print("Fetching chapters...")
     chapters = get_chapters(url)

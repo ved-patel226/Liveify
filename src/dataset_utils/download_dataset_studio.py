@@ -15,7 +15,7 @@ The MP3 files are written to ``downloads/studio_mp3s`` by default.
 import os
 from yt_dlp import YoutubeDL
 
-
+# ===== DRAKE =====
 URLS = [
     "https://www.youtube.com/watch?v=Jy64gM-bI1Q",
     "https://www.youtube.com/watch?v=UQNebFZnEQQ",
@@ -44,6 +44,39 @@ URLS = [
 ]
 
 URLS = ["https://www.youtube.com/watch?v=I4DjHHVHWAE"]
+
+# ===== Carti =====
+
+URLS = [
+    "https://youtu.be/t9KTSbKuxi4?si=DDv7pDAwICbPYv0A",  # RIP Fredo (Notice Me)
+    "https://youtu.be/rQs81CJAWSc?si=ziF62WeV2uo_zeTr",  # Cancun
+    "https://youtu.be/2t5gC28Z_PI?si=UBTQh5PzEtR9oKFo",  # Let it Go
+    "https://youtu.be/FnD72g8urKI?si=WrGfZq19Glpws72M",  # Wokeuplikethis*
+    "https://youtu.be/jxMfGNzwhVo?si=fcrDnXX9xRoHQlhP",  # Half & Half
+    "https://youtu.be/sV_Tlfvt6ig?si=mXQoXOqL3eBQ4gar",  # FlatBed Freestyle
+    "https://youtu.be/ruwgaLd83g4?si=VJ6gairIcNn-awtB",  # Of Course We Ghetto Flowers
+    "https://youtu.be/-2pjiKmhlAI?si=pt_ONA-nvgkkiRTH",  # Home (KOD)
+    "https://youtu.be/5ep6XUPtbHM?si=Ql8dVt6riHfN-NpK",  # Mileage
+    "https://youtu.be/8pC-A0KMztk?si=uHXVA-Pnwfcm7qmP",  # Love Hurts
+    "https://youtu.be/RLYksQvr5zY?si=OnO36TjH3AOEIqbo",  # Magnolia
+    "https://youtu.be/tkPoOvVnbRk?si=qUlbOSY-i5imi1dF",  # Long Time (Intro)
+]
+
+URLS = [  # teca
+    "https://youtu.be/coqEyxNcJmA?si=JyclWDZldaIQxTWS",  # 500 Lbs
+    "https://youtu.be/Csst0G-QfkU?si=UED-taqLY1UEM0cK",  # Dark Thoughts
+    "https://youtu.be/0MDHAz_P8lA?si=uVhiZiVa6pOLRZUn",  # Dead or Alive
+    "https://youtu.be/AH85mAXA-30?si=akDU1D6mzfTuVmKZ",  # Down with me
+    "https://youtu.be/MwYMUSmbEQQ?si=9NNs9xpCnHDWb48O",  # Fell in love
+    "https://youtu.be/dLUI4US3Agk?si=lX4MsoPRv9Ag85Z6",  # Half the plot
+    "https://youtu.be/_5vDT2e1tRk?si=LXZH8bgvI3Z3GB4E",  # Lot of me
+    "https://youtu.be/fLICuTGQMYA?si=g4ZYYuGH-hHio0wk",  # Love me
+    "https://youtu.be/EsjDJ8XpIXw?si=JPkLoTf_L6iRYGmo",  # Never Left
+    "https://youtu.be/-qBgaVRGzfQ?si=kHytCFsonpM_GsHZ",  # On Your Own
+    "https://youtu.be/wTy5dra6CzM?si=TEfek063rKFCScb7",  # OWA OWA
+    "https://youtu.be/AALQwjjk85Y?si=TKWQD4OwN8W-zFZX",  # Ransom
+    "https://youtu.be/W3bLGdKNxB4?si=p7e1bhQxIkfAPKxi",  # Tic tac toe
+]
 
 
 def download_mp3(urls, outdir="downloads/studio_mp3s", cookies=None):
