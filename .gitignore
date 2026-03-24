@@ -11,3 +11,5 @@ spectrograms
 dataset copy
 src/notebooks/cache_audio.npz
 datasetv2
+chapters
+full_audio.mp3

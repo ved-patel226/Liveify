@@ -40,7 +40,7 @@ def _align_pair_worker(args):
 
 
 class StudioLiveDataset(Dataset):
-    __version__ = "0.1.0"
+    version = "0.2.0"
 
     def __init__(
         self,
@@ -52,6 +52,7 @@ class StudioLiveDataset(Dataset):
         context_length=16,
         forward_context_length=0,
         sr=22050,
+        segment_overlap=0.5,
     ):
         """Dataset pairs `studio`/`live` audio files.
 
@@ -68,13 +69,17 @@ class StudioLiveDataset(Dataset):
         self.context_length = context_length
         self.forward_context_length = forward_context_length
         self.sr = sr
+        self.segment_overlap = segment_overlap
+        self.training = False  # Set to True during training for augmentation
+
+        self.segment_hop = int(self.segment_samples * (1.0 - segment_overlap))
+        self.segment_hop = max(self.segment_hop, 1)  # safety
 
         self.has_gpu = torch.cuda.is_available()
 
         studio_files = sorted(os.listdir(self.studio_dir))
         live_files = sorted(os.listdir(self.live_dir))
 
-        # keep pairs as list of tuples so we can use them as dict keys
         self.pairs = [
             (os.path.join(self.studio_dir, sf), os.path.join(self.live_dir, lf))
             for sf, lf in zip(studio_files, live_files)
@@ -88,17 +93,21 @@ class StudioLiveDataset(Dataset):
         if unmatched_live:
             print(f"Warning: Live files with no pairs: {list(unmatched_live)}")
 
+        # cache a flag so repeated setup calls (Lightning can call twice) do not re-align
+        self._has_setup = False
+
         self.pairs_cache = {}
         self._get_local_cache_audio()
         self._align_cache_audio()
 
         if self.pairs_cache:
             min_samples = min(len(v["live_audio"]) for v in self.pairs_cache.values())
-            self._segments_per_song = max(1, min_samples // self.segment_samples)
+            total_context_slots = self.context_length + self.forward_context_length + 1
+            min_needed = total_context_slots * self.segment_samples
+            usable = min_samples - min_needed
+            self._segments_per_song = max(1, usable // self.segment_hop + 1)
         else:
             self._segments_per_song = 0
-
-        print(self.pairs_cache)
 
     def _get_local_cache_audio(self):
         for studio_path, live_path in self.pairs:
@@ -159,59 +168,99 @@ class StudioLiveDataset(Dataset):
             return 0.0
         return SequenceMatcher(None, text1, text2).ratio()
 
+    def _generate_augmentation_params(self):
+        """Generate random augmentation parameters for a single segment.
+        Returns same params to apply to both studio and live for alignment.
+        """
+        if not self.training:
+            return {"pitch_steps": 0, "time_rate": 1.0}
+
+        pitch_steps = 0
+        if np.random.rand() < 0.5:
+            pitch_steps = np.random.uniform(-2, 2)
+
+        time_rate = 1.0
+        if np.random.rand() < 0.5:
+            time_rate = np.random.uniform(0.95, 1.05)
+
+        return {"pitch_steps": pitch_steps, "time_rate": time_rate}
+
+    def _apply_augmentation(self, audio: np.ndarray, params: dict) -> np.ndarray:
+        """Apply audio augmentation with specific parameters.
+        Pitch shift and time stretch preserve alignment when same params used.
+        """
+        pitch_steps = params["pitch_steps"]
+        time_rate = params["time_rate"]
+
+        # Pitch shift ±2 semitones (changes timbre without breaking alignment)
+        if pitch_steps != 0:
+            audio = librosa.effects.pitch_shift(audio, sr=self.sr, n_steps=pitch_steps)
+
+        # Speed change ±5% (subtle, preserves musical content)
+        if time_rate != 1.0:
+            audio = librosa.effects.time_stretch(audio, rate=time_rate)
+            # Truncate or pad back to original length
+            target_len = self.segment_samples
+            if len(audio) > target_len:
+                audio = audio[:target_len]
+            else:
+                audio = np.pad(audio, (0, target_len - len(audio)))
+
+        return audio
+
     def __len__(self):
         return len(self.pairs) * self._segments_per_song
 
     def __getitem__(self, idx):
         song_idx = idx // self._segments_per_song
-        target_segment = idx % self._segments_per_song
+        seg_idx = idx % self._segments_per_song
 
         studio_path, live_path = self.pairs[song_idx]
         audio_dict = self.pairs_cache[(studio_path, live_path)]
 
-        context_start = max(0, target_segment - self.context_length)
-        num_context = (
-            target_segment - context_start
-        )  # how many real context segments exist
-
         total_slots = self.context_length + self.forward_context_length + 1
-
         studio_out = np.zeros((total_slots, self.segment_samples))
         live_out = np.zeros((total_slots, self.segment_samples))
 
-        backward_start_slot = self.context_length - num_context
-        for i, seg_idx in enumerate(range(context_start, target_segment)):
-            slot = backward_start_slot + i
-            s = seg_idx * self.segment_samples
-            e = s + self.segment_samples
-            studio_out[slot] = audio_dict["studio_audio"][s:e]
-            live_out[slot] = audio_dict["live_audio"][s:e]
+        # ═══ CHANGE: use segment_hop for start position ═══
+        target_start = seg_idx * self.segment_hop
 
-        studio_audio = audio_dict["studio_audio"]
-        num_samples = len(studio_audio)
-        for fw_idx in range(self.forward_context_length):
-            forward_seg_idx = target_segment + 1 + fw_idx
-            s = forward_seg_idx * self.segment_samples
-            e = s + self.segment_samples
-            if e <= num_samples:
-                slot = self.context_length + fw_idx
-                studio_out[slot] = studio_audio[s:e]
+        # Fill backward context slots
+        for i in range(self.context_length):
+            slot_start = target_start - (self.context_length - i) * self.segment_hop
+            if slot_start >= 0:
+                s, e = slot_start, slot_start + self.segment_samples
+                if e <= len(audio_dict["studio_audio"]):
+                    studio_out[i] = audio_dict["studio_audio"][s:e]
+                    live_out[i] = audio_dict["live_audio"][s:e]
 
+        # Fill forward context (studio only)
+        for fw in range(self.forward_context_length):
+            slot_start = target_start + (1 + fw) * self.segment_hop
+            s, e = slot_start, slot_start + self.segment_samples
+            slot_idx = self.context_length + fw
+            if e <= len(audio_dict["studio_audio"]):
+                studio_out[slot_idx] = audio_dict["studio_audio"][s:e]
+
+        # Target slot (last)
         target_slot = total_slots - 1
-        s = target_segment * self.segment_samples
-        e = s + self.segment_samples
-        studio_out[target_slot] = audio_dict["studio_audio"][s:e]
-        live_out[target_slot] = audio_dict["live_audio"][s:e]
+        s, e = target_start, target_start + self.segment_samples
+        if e <= len(audio_dict["studio_audio"]):
+            studio_out[target_slot] = audio_dict["studio_audio"][s:e]
+            live_out[target_slot] = audio_dict["live_audio"][s:e]
+
+        for slot in range(total_slots):
+            params = self._generate_augmentation_params()
+            studio_out[slot] = self._apply_augmentation(studio_out[slot], params)
+            live_out[slot] = self._apply_augmentation(live_out[slot], params)
 
         return {
-            "studio_audio": torch.tensor(
-                studio_out, dtype=torch.float32
-            ),  # (backward_context + forward_context + 1, segment_samples)
+            "studio_audio": torch.tensor(studio_out, dtype=torch.float32),
             "live_audio": torch.tensor(live_out, dtype=torch.float32),
-            "num_context": num_context,
+            "num_context": self.context_length,
             "id": live_path,
-            "segment_idx": target_segment,
-            "cache_key": f"{live_path}::seg{target_segment}",
+            "segment_idx": seg_idx,
+            "cache_key": f"{live_path}::seg{seg_idx}",
         }
 
 
@@ -243,9 +292,12 @@ class StudioLiveDataModule(pl.LightningDataModule):
         self.forward_context_length = forward_context_length
         self.train_split = train_split
         self.num_workers = num_workers
+        self.segment_overlap = dataset_kwargs.get("segment_overlap", 0.75)
         self.dataset_kwargs = dataset_kwargs
 
     def setup(self, stage: Optional[str] = None):
+        if getattr(self, "_has_setup", False):
+            return
         full_dataset = StudioLiveDataset(
             studio_dir=self.studio_dir,
             live_dir=self.live_dir,
@@ -255,6 +307,7 @@ class StudioLiveDataModule(pl.LightningDataModule):
             context_length=self.context_length,
             forward_context_length=self.forward_context_length,
             sr=self.sr,
+            segment_overlap=self.segment_overlap,
             **self.dataset_kwargs,
         )
 
@@ -277,7 +330,12 @@ class StudioLiveDataModule(pl.LightningDataModule):
             if (i // full_dataset._segments_per_song) not in train_song_indices
         ]
 
+        # Enable augmentation for training dataset only
+        full_dataset.training = True
         self.train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
+
+        # Disable augmentation for validation dataset
+        full_dataset.training = False
         self.val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
 
         n_train = len(train_indices)
@@ -285,6 +343,7 @@ class StudioLiveDataModule(pl.LightningDataModule):
         print(
             f"Split by songs: {n_train_songs}/{n_songs} songs -> {n_train} train segments, {n_val} val segments"
         )
+        self._has_setup = True
 
     def train_dataloader(self) -> DataLoader:
         effective_workers = (

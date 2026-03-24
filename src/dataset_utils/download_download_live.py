@@ -68,6 +68,30 @@ include_list = {
     "500lbs": {"crop": (0, 60 + 56)},
 }
 
+# YEAT
+
+include_list = {
+    "The Bell": {"crop": (0.5, 10)},
+    "Turban": {"crop": (2, 26)},
+    # "Gët Busy": {"crop": (0, 0)},
+    "Poppin": {"crop": (1, 12)},
+    "On tha linë": {"crop": (13, 22)},
+    # "Sorry Bout That": {"crop": (0, 0)},
+    "Money Twërk": {"crop": (13, 13)},
+    # "Monëy so big": {"crop": (0.5, 13)},
+    "Flawlëss": {"crop": (37, 0)},
+    "Swërved It": {"crop": (0, 0)},
+    "Talk": {"crop": (0, 18)},
+    # "Out thë Way": {"crop": (0.5, 0)},
+    "GEEK TIMË": {"crop": (11, 11)},
+    # "ORCHESTRATËD": {"crop": (0, 0)},
+    # "ILUV": {"crop": ()},
+    "If We Being Rëal": {"crop": (25, 25)},
+    "IM YEAT": {"crop": (27.5, 36)},
+    "OH I DID": {"crop": (5, 17)},
+    # "IDGAF": {"crop": (60 + 4.85, 0)},
+}
+
 
 def get_chapters(youtube_url):
     ydl_opts = {"quiet": True, "skip_download": True}
@@ -113,6 +137,7 @@ def crop_chapter(input_file, start, end, crop_start, crop_end, output_file):
 if __name__ == "__main__":
     url = "https://www.youtube.com/watch?v=MGEWtssL4IA"  # Drake
     url = "https://youtu.be/vA3CZNPnnA8?si=au4exBLWYOGQ36ZL"  # Tecca
+    url = "https://youtu.be/I8GVQBPdfsc?si=ypypx8wKGrOLNBjK"  # Yeat
 
     print("Fetching chapters...")
     chapters = get_chapters(url)

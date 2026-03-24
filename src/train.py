@@ -2,7 +2,6 @@ import torch
 
 torch.set_float32_matmul_precision("high")
 
-import torchaudio
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 
@@ -36,171 +35,6 @@ _SPEC_KW = dict(aspect="auto", origin="lower", cmap="magma", vmin=-1, vmax=1)
 _DIFF_KW = dict(aspect="auto", origin="lower", cmap="RdBu_r", vmin=-1, vmax=1)
 
 
-def make_comparison_figure(
-    studio: np.ndarray,
-    output: np.ndarray,
-    target: np.ndarray,
-    epoch: int,
-    sample_idx: int,
-) -> plt.Figure:
-    diff = output - target
-    mae = np.abs(diff).mean()
-
-    fig, axes = plt.subplots(1, 4, figsize=(22, 4))
-    fig.suptitle(
-        f"Epoch {epoch}  |  Sample {sample_idx}  |  MAE = {mae:.4f}",
-        fontsize=11,
-        fontweight="bold",
-    )
-
-    panels = [
-        (studio, "Studio (input)", _SPEC_KW),
-        (output, "Model output", _SPEC_KW),
-        (target, "Live target", _SPEC_KW),
-        (diff, "Signed diff (out-tgt)", _DIFF_KW),
-    ]
-    for ax, (data, title, kw) in zip(axes, panels):
-        im = ax.imshow(data, **kw)
-        ax.set_title(title, fontsize=9)
-        ax.set_xlabel("Time frame")
-        ax.set_ylabel("Mel bin")
-        plt.colorbar(im, ax=ax, shrink=0.8)
-
-    fig.tight_layout()
-    return fig
-
-
-def make_context_strip_figure(
-    context_slots: np.ndarray,  # (S, F, T)
-    num_context: int,
-    epoch: int,
-    sample_idx: int,
-) -> plt.Figure:
-    S, F, T = context_slots.shape
-    fig, axes = plt.subplots(1, S, figsize=(max(S * 2, 6), 3))
-    if S == 1:
-        axes = [axes]
-
-    fig.suptitle(
-        f"Context strip  |  Epoch {epoch}  |  Sample {sample_idx}  "
-        f"({num_context} valid context + 1 target)",
-        fontsize=9,
-        fontweight="bold",
-    )
-
-    first_valid = S - 1 - num_context
-
-    for slot_i, ax in enumerate(axes):
-        ax.imshow(context_slots[slot_i], **_SPEC_KW)
-        ax.set_xticks([])
-        ax.set_yticks([])
-
-        if slot_i == S - 1:
-            label, color = "TARGET", "gold"
-        elif slot_i >= first_valid:
-            label, color = f"ctx {slot_i - first_valid}", "limegreen"
-        else:
-            label, color = "PAD", "tomato"
-
-        ax.set_title(label, fontsize=7, color=color, fontweight="bold")
-        for spine in ax.spines.values():
-            spine.set_edgecolor(color)
-            spine.set_linewidth(2)
-
-    fig.tight_layout()
-    return fig
-
-
-def make_error_histogram_figure(
-    outputs: list,
-    targets: list,
-    epoch: int,
-) -> plt.Figure:
-    """
-    Distribution of per-pixel signed errors across all visualisation samples.
-
-    What to look for:
-      - Centred on 0 = unbiased predictions (good)
-      - Shrinking spread over epochs = the model is learning
-      - Peak at a non-zero value = systematic bias (bad)
-      - All mass at 0 = mode collapse / model always predicts mean
-    """
-    errors = np.concatenate([(o - t).ravel() for o, t in zip(outputs, targets)])
-    mean_e = errors.mean()
-    std_e = errors.std()
-    mae = np.abs(errors).mean()
-
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.hist(
-        errors, bins=100, range=(-2, 2), color="steelblue", alpha=0.75, density=True
-    )
-    ax.axvline(0, color="black", lw=1.5, ls="--", label="zero")
-    ax.axvline(mean_e, color="tomato", lw=1.5, ls="-", label=f"mean = {mean_e:.4f}")
-    ax.set_title(
-        f"Error distribution  |  Epoch {epoch}  |  "
-        f"μ={mean_e:.4f}  σ={std_e:.4f}  MAE={mae:.4f}",
-        fontsize=10,
-    )
-    ax.set_xlabel("output − target (pixel value)")
-    ax.set_ylabel("density")
-    ax.legend(fontsize=9)
-    fig.tight_layout()
-    return fig
-
-
-def make_output_stats_figure(
-    outputs: list,
-    targets: list,
-    epoch: int,
-) -> plt.Figure:
-    """
-    Bar chart: mean / std / min / max of model outputs vs live targets.
-
-    Immediate mode-collapse detector: if output_std << target_std the model
-    is predicting a near-constant spectrogram.
-    """
-
-    def stats(arrs):
-        flat = np.concatenate([a.ravel() for a in arrs])
-        return dict(
-            mean=float(flat.mean()),
-            std=float(flat.std()),
-            min=float(flat.min()),
-            max=float(flat.max()),
-        )
-
-    out_s = stats(outputs)
-    tgt_s = stats(targets)
-    keys = ["mean", "std", "min", "max"]
-    x = np.arange(len(keys))
-    w = 0.35
-
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.bar(
-        x - w / 2,
-        [out_s[k] for k in keys],
-        w,
-        label="model output",
-        color="steelblue",
-        alpha=0.8,
-    )
-    ax.bar(
-        x + w / 2,
-        [tgt_s[k] for k in keys],
-        w,
-        label="live target",
-        color="darkorange",
-        alpha=0.8,
-    )
-    ax.set_xticks(x)
-    ax.set_xticklabels(keys)
-    ax.axhline(0, color="black", lw=0.8, ls="--")
-    ax.set_title(f"Output vs target pixel statistics  |  Epoch {epoch}", fontsize=10)
-    ax.legend(fontsize=9)
-    fig.tight_layout()
-    return fig
-
-
 def train(args=None):
     if args is None:
         args = parse_args()
@@ -223,19 +57,33 @@ def train(args=None):
 
     print("Encodec latent model config:")
     print(
-        f"  Context length : {args.context_length} past + 1 current = {args.context_length+1} slots"
+        f"  Context length : {args.context_length} past + {args.forward_context_length} future + 1 current = "
+        f"{args.context_length + args.forward_context_length + 1} slots"
     )
+
     print(f"  Latent dim     : 128 (Encodec encoder output)")
     print(
         f"  Model          : Cross-attention transformer, layers={args.latent_layers}"
     )
 
+    # model = EncodecLatentModel(
+    #     latent_dim=128,
+    #     context_length=args.context_length,
+    #     forward_context_length=args.forward_context_length,
+    #     num_layers=args.latent_layers,
+    #     dropout=args.dropout,
+    # )
+
     model = EncodecLatentModel(
         latent_dim=128,
         context_length=args.context_length,
         forward_context_length=args.forward_context_length,
-        num_layers=args.latent_layers,
-        dropout=args.dropout,
+        d_model=128,  # ← was 256
+        num_heads=4,  # ← was 8
+        num_layers=args.latent_layers,  # default now 2
+        ff_mult=2,  # ← was 4
+        dropout=args.dropout,  # default now 0.3
+        drop_path=0.1,
     )
 
     lightning_module = EncodecLatentLightningModule(
@@ -278,7 +126,7 @@ def train(args=None):
         precision=args.precision,
         callbacks=[checkpoint_callback],
         logger=logger,
-        log_every_n_steps=10,  # Reduced from 1 to cut wandb overhead
+        log_every_n_steps=10,
         gradient_clip_val=1,
         gradient_clip_algorithm="norm",
         accumulate_grad_batches=args.accumulate_grad_batches,
@@ -325,10 +173,10 @@ def parse_args():
     parser.add_argument(
         "--forward_context_length",
         type=int,
-        default=0,
+        default=12,
         help="Number of future frames from studio to include as context (live remains zero-padded).",
     )
-    parser.add_argument("--train_split", type=float, default=0.8)
+    parser.add_argument("--train_split", type=float, default=0.85)
     parser.add_argument(
         "--encodec_bandwidth",
         type=float,
@@ -351,7 +199,7 @@ def parse_args():
     )
 
     # model
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument(
         "--latent_layers",
         type=int,
