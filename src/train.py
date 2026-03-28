@@ -53,6 +53,7 @@ def train(args=None):
         forward_context_length=args.forward_context_length,
         train_split=args.train_split,
         num_workers=args.num_workers,
+        segment_overlap=args.segment_overlap,
     )
 
     print("Encodec latent model config:")
@@ -66,24 +67,16 @@ def train(args=None):
         f"  Model          : Cross-attention transformer, layers={args.latent_layers}"
     )
 
-    # model = EncodecLatentModel(
-    #     latent_dim=128,
-    #     context_length=args.context_length,
-    #     forward_context_length=args.forward_context_length,
-    #     num_layers=args.latent_layers,
-    #     dropout=args.dropout,
-    # )
-
     model = EncodecLatentModel(
         latent_dim=128,
         context_length=args.context_length,
         forward_context_length=args.forward_context_length,
-        d_model=128,  # ← was 256
-        num_heads=4,  # ← was 8
-        num_layers=args.latent_layers,  # default now 2
-        ff_mult=2,  # ← was 4
-        dropout=args.dropout,  # default now 0.3
-        drop_path=0.1,
+        d_model=args.d_model,
+        num_heads=args.num_heads,
+        num_layers=args.latent_layers,
+        ff_mult=args.ff_mult,
+        dropout=args.dropout,
+        drop_path=args.drop_path,
     )
 
     lightning_module = EncodecLatentLightningModule(
@@ -165,15 +158,16 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train Liveify model")
 
     # data
-    parser.add_argument("--studio_dir", type=str, default="./datasetv2/studio")
-    parser.add_argument("--live_dir", type=str, default="./datasetv2/live")
+    parser.add_argument("--studio_dir", type=str, default="../datasetv2/studio")
+    parser.add_argument("--live_dir", type=str, default="../datasetv2/live")
     parser.add_argument("--sample_rate", type=int, default=48000)
-    parser.add_argument("--segment_duration", type=float, default=1.0)
-    parser.add_argument("--context_length", type=int, default=8)
+    parser.add_argument("--segment_duration", type=float, default=0.5)
+    parser.add_argument("--segment_overlap", type=float, default=0.75)
+    parser.add_argument("--context_length", type=int, default=12)
     parser.add_argument(
         "--forward_context_length",
         type=int,
-        default=12,
+        default=24,
         help="Number of future frames from studio to include as context (live remains zero-padded).",
     )
     parser.add_argument("--train_split", type=float, default=0.85)
@@ -199,7 +193,11 @@ def parse_args():
     )
 
     # model
-    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--d_model", type=int, default=128)
+    parser.add_argument("--num_heads", type=int, default=4)
+    parser.add_argument("--ff_mult", type=int, default=2)
+    parser.add_argument("--drop_path", type=float, default=0.1)
+    parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument(
         "--latent_layers",
         type=int,

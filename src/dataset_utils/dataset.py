@@ -52,7 +52,7 @@ class StudioLiveDataset(Dataset):
         context_length=16,
         forward_context_length=0,
         sr=22050,
-        segment_overlap=0.5,
+        segment_overlap=0.875,
     ):
         """Dataset pairs `studio`/`live` audio files.
 
@@ -222,37 +222,40 @@ class StudioLiveDataset(Dataset):
         studio_out = np.zeros((total_slots, self.segment_samples))
         live_out = np.zeros((total_slots, self.segment_samples))
 
-        # ═══ CHANGE: use segment_hop for start position ═══
         target_start = seg_idx * self.segment_hop
 
-        # Fill backward context slots
         for i in range(self.context_length):
-            slot_start = target_start - (self.context_length - i) * self.segment_hop
-            if slot_start >= 0:
-                s, e = slot_start, slot_start + self.segment_samples
-                if e <= len(audio_dict["studio_audio"]):
-                    studio_out[i] = audio_dict["studio_audio"][s:e]
-                    live_out[i] = audio_dict["live_audio"][s:e]
+            slot_idx = i
+            s = target_start - (self.context_length - i) * self.segment_hop
+            e = s + self.segment_samples
+            if s >= 0 and e <= len(audio_dict["studio_audio"]):
+                studio_out[slot_idx] = audio_dict["studio_audio"][s:e]
+                live_out[slot_idx] = audio_dict["live_audio"][s:e]
 
-        # Fill forward context (studio only)
         for fw in range(self.forward_context_length):
-            slot_start = target_start + (1 + fw) * self.segment_hop
-            s, e = slot_start, slot_start + self.segment_samples
             slot_idx = self.context_length + fw
+            s = target_start + (fw + 1) * self.segment_hop
+            e = s + self.segment_samples
             if e <= len(audio_dict["studio_audio"]):
                 studio_out[slot_idx] = audio_dict["studio_audio"][s:e]
 
-        # Target slot (last)
         target_slot = total_slots - 1
         s, e = target_start, target_start + self.segment_samples
         if e <= len(audio_dict["studio_audio"]):
             studio_out[target_slot] = audio_dict["studio_audio"][s:e]
             live_out[target_slot] = audio_dict["live_audio"][s:e]
 
-        for slot in range(total_slots):
-            params = self._generate_augmentation_params()
-            studio_out[slot] = self._apply_augmentation(studio_out[slot], params)
-            live_out[slot] = self._apply_augmentation(live_out[slot], params)
+        if self.training:
+            aug_params = self._generate_augmentation_params()
+            for slot in range(total_slots):
+                if np.any(studio_out[slot]):
+                    studio_out[slot] = self._apply_augmentation(
+                        studio_out[slot], aug_params
+                    )
+                if np.any(live_out[slot]):
+                    live_out[slot] = self._apply_augmentation(
+                        live_out[slot], aug_params
+                    )
 
         return {
             "studio_audio": torch.tensor(studio_out, dtype=torch.float32),
@@ -292,13 +295,15 @@ class StudioLiveDataModule(pl.LightningDataModule):
         self.forward_context_length = forward_context_length
         self.train_split = train_split
         self.num_workers = num_workers
-        self.segment_overlap = dataset_kwargs.get("segment_overlap", 0.75)
+        self.segment_overlap = dataset_kwargs.pop("segment_overlap", 0.75)
         self.dataset_kwargs = dataset_kwargs
 
-    def setup(self, stage: Optional[str] = None):
+    def setup(self, stage=None):
         if getattr(self, "_has_setup", False):
             return
-        full_dataset = StudioLiveDataset(
+
+        # Create TWO separate dataset instances
+        common_kwargs = dict(
             studio_dir=self.studio_dir,
             live_dir=self.live_dir,
             segment_duration=self.segment_duration,
@@ -311,14 +316,12 @@ class StudioLiveDataModule(pl.LightningDataModule):
             **self.dataset_kwargs,
         )
 
+        full_dataset = StudioLiveDataset(**common_kwargs)
+
         n_songs = len(full_dataset.pairs)
         n_train_songs = int(n_songs * self.train_split)
+        train_song_indices = set(range(n_train_songs))
 
-        # split song indices
-        song_indices = list(range(n_songs))
-        train_song_indices = set(song_indices[:n_train_songs])
-
-        # create datasets based on song splits
         train_indices = [
             i
             for i in range(len(full_dataset))
@@ -330,18 +333,19 @@ class StudioLiveDataModule(pl.LightningDataModule):
             if (i // full_dataset._segments_per_song) not in train_song_indices
         ]
 
-        # Enable augmentation for training dataset only
-        full_dataset.training = True
-        self.train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
+        # Separate datasets so .training flag is independent
+        import copy
 
-        # Disable augmentation for validation dataset
-        full_dataset.training = False
-        self.val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
+        train_ds = copy.copy(full_dataset)  # shallow copy shares the audio cache
+        train_ds.training = True
+        val_ds = copy.copy(full_dataset)
+        val_ds.training = False
 
-        n_train = len(train_indices)
-        n_val = len(val_indices)
+        self.train_dataset = torch.utils.data.Subset(train_ds, train_indices)
+        self.val_dataset = torch.utils.data.Subset(val_ds, val_indices)
+
         print(
-            f"Split by songs: {n_train_songs}/{n_songs} songs -> {n_train} train segments, {n_val} val segments"
+            f"Split: {n_train_songs}/{n_songs} songs → {len(train_indices)} train, {len(val_indices)} val"
         )
         self._has_setup = True
 

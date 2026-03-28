@@ -62,7 +62,7 @@ URLS = [
     "https://youtu.be/tkPoOvVnbRk?si=qUlbOSY-i5imi1dF",  # Long Time (Intro)
 ]
 
-URLS = [  # teca
+URLS = [  # tecca
     "https://youtu.be/coqEyxNcJmA?si=JyclWDZldaIQxTWS",  # 500 Lbs
     "https://youtu.be/Csst0G-QfkU?si=UED-taqLY1UEM0cK",  # Dark Thoughts
     "https://youtu.be/0MDHAz_P8lA?si=uVhiZiVa6pOLRZUn",  # Dead or Alive
@@ -77,6 +77,22 @@ URLS = [  # teca
     "https://youtu.be/AALQwjjk85Y?si=TKWQD4OwN8W-zFZX",  # Ransom
     "https://youtu.be/W3bLGdKNxB4?si=p7e1bhQxIkfAPKxi",  # Tic tac toe
 ]
+
+URLS = [  # yeat
+    "https://youtu.be/NzXGXMgdGOI?si=Aoq3mWXWlMSuzAFO",  # flawless
+    "https://youtu.be/ry-6RvkH880?si=r8X-2fsQCCutZodL",  # geek time
+    "https://youtu.be/1xcvWmN0Pe4?si=SRPOmZJB6T5k6NuB",  # if we being real
+    "https://youtu.be/pohQezw8VRw?si=lPZAnzwVu-Ck2TNP",  # im yeat
+    "https://youtu.be/Udi5-qWw4Dw?si=P7Dh9nKulQAT4f-j",  # money twrek
+    "https://youtu.be/JWfPqRCk49I?si=ESjvfYSvRIi8FXSB",  # oh i did
+    "https://youtu.be/K8q-3m_q9UE?si=F8bcquJ4rRVnczJ2",  # poppin
+    "https://youtu.be/3B96JrmP5UI?si=jIO9w5CWnkkITnC-",  # swerved it
+    "https://youtu.be/7Qe6qcNuyYY?si=LZgrh5XN2EphAlqA",  # talk
+    "https://youtu.be/aERhZcM5CLY?si=Nr16FAwqwSaUAbC4",  # the bell
+    "https://youtu.be/c8O0KOas5jU?si=GFwQWYxYVInrRS00",  # turban
+]
+
+URLS = ["https://youtu.be/tuiOR-iPT10?si=k4Z8drB90K0KupKG"]  # on tha line
 
 
 def download_mp3(urls, outdir="downloads/studio_mp3s", cookies=None):

@@ -17,12 +17,20 @@ try:
     from model_utils import (
         MultiScaleSTFTLoss,
         LearnedPositionalEncoding1D,
+        SelfAttentionBlock,
+        GatedCrossAttentionBlock,
+        RotaryPositionalEncoding,
+        AttentionPool,
         CrossAttentionBlock,
     )
 except ImportError:
     from .model_utils import (
         MultiScaleSTFTLoss,
         LearnedPositionalEncoding1D,
+        SelfAttentionBlock,
+        GatedCrossAttentionBlock,
+        RotaryPositionalEncoding,
+        AttentionPool,
         CrossAttentionBlock,
     )
 
@@ -54,7 +62,16 @@ class BaseLiveifyModel(torch.nn.Module):
 
 class EncodecLatentModel(BaseLiveifyModel):
     """
-    v2: ~500K params (down from 6.5M).
+    Two-level hierarchical transformer for Encodec latents.
+
+    Level 1 (intra-slot):  Self-attention *within* each segment.
+                           Complexity: O(S · T²)   — linear in # slots.
+    Level 2 (inter-slot):  Self-attention *across* slot summaries.
+                           Complexity: O(S²)        — independent of T.
+    Final:                 Target-slot tokens cross-attend to the
+                           inter-slot representations.
+
+    Total complexity:  O(S·T² + S²).
     """
 
     def __init__(
@@ -62,12 +79,15 @@ class EncodecLatentModel(BaseLiveifyModel):
         latent_dim: int = 128,
         context_length: int = 4,
         forward_context_length: int = 0,
-        d_model: int = 128,
-        num_heads: int = 4,
-        num_layers: int = 2,
-        ff_mult: int = 2,
-        dropout: float = 0.3,
+        d_model: int = 256,
+        num_heads: int = 8,
+        intra_layers: int = 2,
+        inter_layers: int = 4,
+        final_cross_layers: int = 2,
+        ff_mult: int = 4,
+        dropout: float = 0.1,
         drop_path: float = 0.1,
+        num_layers: int | None = None,
     ):
         super().__init__(
             input_fdim=latent_dim,
@@ -82,28 +102,44 @@ class EncodecLatentModel(BaseLiveifyModel):
         self.d_model = d_model
         self.num_slots = context_length + 1 + forward_context_length
 
-        # ═══ CHANGE: single shared projection (was two separate ones) ═══
+        # projection
         self.latent_proj = nn.Sequential(
             nn.Linear(latent_dim, d_model),
             nn.Dropout(dropout),
         )
 
-        # ═══ NEW: slot positional embeddings ═══
-        # Without this, the model has NO idea which context frame is recent vs old
-        self.slot_embed = nn.Embedding(self.num_slots, d_model)
+        # slot-type embedding: 0=past_live, 1=forward_studio, 2=target_studio, 3=unused
+        self.slot_type_embed = nn.Embedding(4, d_model)
 
-        # ═══ NEW: temporal positional encoding within each segment ═══
-        self.temporal_pos = LearnedPositionalEncoding1D(
-            d_model, max_len=512, dropout=dropout
+        # RoPE pos encoding for both levels (separate, since they have different sequence lengths)
+        self.intra_pos = RotaryPositionalEncoding(d_model, max_len=1024)
+        self.inter_pos = RotaryPositionalEncoding(d_model, max_len=4096)
+
+        # level 1: intra-slot self-attention
+        intra_dp = torch.linspace(0, drop_path * 0.5, intra_layers).tolist()
+        self.intra_layers = nn.ModuleList(
+            [
+                SelfAttentionBlock(d_model, num_heads, ff_mult, dropout, intra_dp[i])
+                for i in range(intra_layers)
+            ]
         )
 
-        # Linearly increasing stochastic depth rates
-        dp_rates = torch.linspace(0, drop_path, num_layers).tolist()
+        self.slot_pool = AttentionPool(d_model)
 
-        self.layers = nn.ModuleList(
+        # level 2: inter-slot self-attention
+        inter_dp = torch.linspace(0, drop_path, inter_layers).tolist()
+        self.inter_layers = nn.ModuleList(
             [
-                CrossAttentionBlock(d_model, num_heads, ff_mult, dropout, dp_rates[i])
-                for i in range(num_layers)
+                SelfAttentionBlock(d_model, num_heads, ff_mult, dropout, inter_dp[i])
+                for i in range(inter_layers)
+            ]
+        )
+
+        final_dp = torch.linspace(0, drop_path * 0.5, final_cross_layers).tolist()
+        self.final_cross = nn.ModuleList(
+            [
+                CrossAttentionBlock(d_model, num_heads, ff_mult, dropout, final_dp[i])
+                for i in range(final_cross_layers)
             ]
         )
 
@@ -111,39 +147,72 @@ class EncodecLatentModel(BaseLiveifyModel):
             nn.LayerNorm(d_model),
             nn.Linear(d_model, latent_dim),
         )
-
-        # Zero-init → starts as identity (residual = 0)
         nn.init.zeros_(self.output_proj[-1].weight)
         nn.init.zeros_(self.output_proj[-1].bias)
 
+    def _build_slot_types(
+        self, batch_size: int, S: int, device: torch.device
+    ) -> torch.Tensor:
+        """Return (B, S) int tensor: 0=past_live  1=forward_studio  2=target_studio.
+
+        Dynamically assigns types based on actual input size S,
+        not just the configured values — so it works even if S
+        doesn't exactly match context_length + forward_context_length + 1.
+        """
+        types = torch.ones(batch_size, S, dtype=torch.long, device=device)
+        types[:, -1] = 2  # last slot is always target (studio)
+
+        # everything before context_length is past (live, type 0)
+        n_past = min(self.context_length, S - 1)
+        types[:, :n_past] = 0  # past slots = live
+        # types[:, n_past:-1] = 1 (forward slots = studio, already set above)
+
+        return types
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, S, C, T) — S slots, C=latent_dim, T=temporal frames
+        Returns:
+            (B, C, T) — predicted latent for the target slot
+        """
         B, S, C, T = x.shape
 
-        ctx = x[:, :-1]  # (B, S-1, C, T)
-        tgt = x[:, -1]  # (B, C, T)
-        tgt_raw = rearrange(tgt, "b c t -> b t c")  # (B, T, latent_dim)
+        # raw target for residual connection
+        tgt_raw = x[:, -1].transpose(1, 2)  # (B, T, C)
 
-        # ═══ Build context: project each slot, add temporal + slot position ═══
-        ctx_tokens = []
-        for s in range(S - 1):
-            slot = rearrange(ctx[:, s], "b c t -> b t c")  # (B, T, C)
-            proj = self.latent_proj(slot)  # (B, T, d_model)
-            proj = self.temporal_pos(proj)  # temporal position within segment
-            proj = proj + self.slot_embed.weight[s]  # which segment in the window
-            ctx_tokens.append(proj)
-        ctx_proj = torch.cat(ctx_tokens, dim=1)  # (B, (S-1)*T, d_model)
+        # project all tokens
+        tokens = rearrange(x, "b s c t -> (b s) t c")  # (B*S, T, C)
+        tokens = self.latent_proj(tokens)  # (B*S, T, D)
 
-        # ═══ Target: same projection + its own slot identity ═══
-        tgt_proj = self.latent_proj(tgt_raw)
-        tgt_proj = self.temporal_pos(tgt_proj)
-        tgt_proj = tgt_proj + self.slot_embed.weight[S - 1]
+        # level 1: intra-slot self-attention  O(S · T²)
+        tokens = self.intra_pos(tokens)
+        for layer in self.intra_layers:
+            tokens = layer(tokens)  # (B*S, T, D)
 
-        for layer in self.layers:
-            tgt_proj = layer(tgt_proj, ctx_proj)
+        all_tokens = rearrange(tokens, "(b s) t d -> b s t d", b=B)
+        tgt_tokens = all_tokens[:, -1]  # (B, T, D)
 
-        delta = self.output_proj(tgt_proj)  # (B, T, latent_dim)
+        # slot pooling: (B*S, T, D) → (B, S, D)
+        slot_summaries = self.slot_pool(tokens)  # (B*S, D)
+        slot_summaries = rearrange(slot_summaries, "(b s) d -> b s d", b=B)
+
+        # slot-type embeddings
+        slot_types = self._build_slot_types(B, S, x.device)
+        slot_summaries = slot_summaries + self.slot_type_embed(slot_types)
+
+        # level 2: inter-slot self-attention  O(S²)
+        slot_summaries = self.inter_pos(slot_summaries)
+        for layer in self.inter_layers:
+            slot_summaries = layer(slot_summaries)  # (B, S, D)
+
+        # tokens cross-attend to slot context
+        for layer in self.final_cross:
+            tgt_tokens = layer(tgt_tokens, slot_summaries)  # (B, T, D)
+
+        delta = self.output_proj(tgt_tokens)  # (B, T, C)
         out = tgt_raw + delta
-        return out.clamp(-10.0, 10.0).transpose(1, 2)  # (B, latent_dim, T)
+        return out.clamp(-10.0, 10.0).transpose(1, 2)  # (B, C, T)
 
 
 class EncodecLatentLightningModule(pl.LightningModule):
@@ -155,7 +224,6 @@ class EncodecLatentLightningModule(pl.LightningModule):
         encodec_bandwidth: float = 6.0,
         encodec_sample_rate: int = 24000,
         cache_dir: str = "logs/encodec_latents",
-        latent_noise_std: float = 0.05,  # ← increased from 0.02
         forward_context_length: int = 0,
         context_mask_prob: float = 0.2,
     ):
@@ -165,7 +233,6 @@ class EncodecLatentLightningModule(pl.LightningModule):
         self.data_sample_rate = sample_rate
         self.encodec_bandwidth = encodec_bandwidth
         self.encodec_sample_rate = encodec_sample_rate
-        self.latent_noise_std = latent_noise_std
         self.forward_context_length = forward_context_length
         self.context_mask_prob = context_mask_prob
 
@@ -190,24 +257,14 @@ class EncodecLatentLightningModule(pl.LightningModule):
         B, S, C, T = x_lat.shape
         x_lat = x_lat.clone()
 
-        # Context masking (increased)
         if S > 2 and self.context_mask_prob > 0:
             mask = (
-                torch.rand(B, S - 1, 1, 1, device=x_lat.device) > 0.4  # ← was 0.2
+                torch.rand(B, S - 1, 1, 1, device=x_lat.device) > self.context_mask_prob
             ).float()
             x_lat[:, :-1] = x_lat[:, :-1] * mask
 
-        noise_scale = x_lat.std() * 0.15  # ← was 0.05
+        noise_scale = x_lat.std() * 0.02
         x_lat = x_lat + torch.randn_like(x_lat) * noise_scale
-
-        gain = 1.0 + 0.2 * torch.randn(B, S, 1, 1, device=x_lat.device)  # ← was 0.1
-        x_lat = x_lat * gain
-
-        time_mask = (torch.rand(B, 1, 1, T, device=x_lat.device) > 0.1).float()
-        x_lat = x_lat * time_mask
-
-        chan_mask = (torch.rand(B, 1, C, 1, device=x_lat.device) > 0.1).float()
-        x_lat = x_lat * chan_mask
 
         return x_lat
 
@@ -311,8 +368,9 @@ class EncodecLatentLightningModule(pl.LightningModule):
             target = target[..., :pt]
         return pred, target
 
-    def compute_loss(self, pred, target, **kwargs):
+    def compute_loss(self, pred, target, decode_loss=False):
         pred, target = self._align_time(pred, target)
+
         l1 = F.l1_loss(pred, target)
         cos = (
             1.0
@@ -320,25 +378,34 @@ class EncodecLatentLightningModule(pl.LightningModule):
                 pred.transpose(1, 2), target.transpose(1, 2), dim=-1
             ).mean()
         )
-        return l1 + 0.1 * cos
+        loss = l1 + 0.1 * cos
+
+        return loss
 
     def training_step(self, batch, batch_idx):
         studio_audio, live_audio = batch["studio_audio"], batch["live_audio"]
         cache_keys = batch.get("cache_key")
 
-        x_lat = self._encode_audio(
+        x_studio = self._encode_audio(
             studio_audio, [f"studio::{k}" for k in cache_keys] if cache_keys else None
         )
-        y_lat = self._encode_audio(
+        x_live = self._encode_audio(
             live_audio, [f"live::{k}" for k in cache_keys] if cache_keys else None
         )
 
-        x_lat = self._augment_latents(x_lat)  # keep augmentation
-        # NO mixup, NO R-drop
+        # ── Build mixed input: past=LIVE, forward+target=STUDIO ──
+        ctx_len = self.model.context_length
+        mixed = x_studio.clone()
+        mixed[:, :ctx_len] = x_live[:, :ctx_len]  # past context uses live audio
 
-        target = y_lat[:, -1]
-        y_pred = self(x_lat)
-        loss = self.compute_loss(y_pred, target)
+        mixed = self._augment_latents(mixed)
+
+        target = x_live[:, -1]
+        y_pred = self(mixed)
+
+        # decode every 2 steps to save VRAM
+        decode_loss = self.global_step % 2 == 0
+        loss = self.compute_loss(y_pred, target, decode_loss=decode_loss)
 
         self.log("train/loss", loss, prog_bar=True)
         return loss
@@ -347,17 +414,24 @@ class EncodecLatentLightningModule(pl.LightningModule):
         studio_audio, live_audio = batch["studio_audio"], batch["live_audio"]
         cache_keys = batch.get("cache_key")
 
-        x_lat = self._encode_audio(
+        x_studio = self._encode_audio(
             studio_audio, [f"studio::{k}" for k in cache_keys] if cache_keys else None
         )
-        y_lat = self._encode_audio(
+        x_live = self._encode_audio(
             live_audio, [f"live::{k}" for k in cache_keys] if cache_keys else None
         )
 
-        y_pred = self(x_lat)
-        target = y_lat[:, -1]
-        loss = self.compute_loss(y_pred, target)
-        trivial = self.compute_loss(x_lat[:, -1], target)
+        # Same mixed input strategy
+        ctx_len = self.model.context_length
+        mixed = x_studio.clone()
+        mixed[:, :ctx_len] = x_live[:, :ctx_len]
+
+        y_pred = self(mixed)
+        target = x_live[:, -1]
+
+        # ALWAYS decode on val so metric is meaningful
+        loss = self.compute_loss(y_pred, target, decode_loss=True)
+        trivial = self.compute_loss(x_studio[:, -1], target, decode_loss=False)
 
         self.log("val/loss", loss, prog_bar=True)
         self.log("val/trivial_baseline", trivial)
@@ -365,7 +439,34 @@ class EncodecLatentLightningModule(pl.LightningModule):
         if not self._val_preview_logged:
             self._val_preview_logged = True
             self._log_latent_preview(y_pred.detach(), target.detach())
+            self._log_audio_preview(y_pred.detach(), target.detach())
         return loss
+
+    def _log_audio_preview(self, pred, target):
+        """Decode and log actual audio so you can HEAR the quality."""
+        if pred.numel() == 0:
+            return
+        with torch.no_grad():
+            pred_audio = self.encodec.decoder(pred[:1].float())
+            target_audio = self.encodec.decoder(target[:1].float())
+        logger = getattr(self.logger, "experiment", None)
+        if logger and hasattr(logger, "log"):
+            import wandb as wb
+
+            logger.log(
+                {
+                    "val/pred_audio": wb.Audio(
+                        pred_audio[0, 0].cpu().float().numpy(),
+                        sample_rate=self.encodec_sample_rate,
+                        caption="predicted",
+                    ),
+                    "val/target_audio": wb.Audio(
+                        target_audio[0, 0].cpu().float().numpy(),
+                        sample_rate=self.encodec_sample_rate,
+                        caption="target",
+                    ),
+                }
+            )
 
     def on_validation_epoch_start(self):
         self._val_preview_logged = False
@@ -398,28 +499,28 @@ class EncodecLatentLightningModule(pl.LightningModule):
             )
             self.log("train/grad_norm", norm, on_step=True, on_epoch=False)
 
-    # ═══ CHANGE: cosine LR with warmup (was ReduceLROnPlateau with patience=1000) ═══
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
             [p for p in self.parameters() if p.requires_grad],
             lr=self.learning_rate,
             betas=(0.9, 0.98),
-            weight_decay=0.1,  # ← was 0.05
+            weight_decay=1e-6,
         )
 
-        total_steps = self.trainer.estimated_stepping_batches
-        warmup_steps = min(500, total_steps // 10)
-
-        def lr_lambda(step):
-            if step < warmup_steps:
-                return step / max(1, warmup_steps)
-            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=150,
+        )
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "monitor": "train/loss",
+                "frequency": 1,
+            },
         }
 
 
@@ -428,16 +529,16 @@ def main():
 
     model = EncodecLatentModel(
         latent_dim=128,
-        context_length=4,
-        forward_context_length=4,
-        d_model=128,  # ← was 256
-        num_heads=4,  # ← was 8
-        num_layers=2,  # default now 2
-        ff_mult=2,  # ← was 4
-        dropout=0.2,  # default now 0.3
+        context_length=12,
+        forward_context_length=12,
+        d_model=128,
+        num_heads=4,
+        num_layers=2,
+        ff_mult=2,
+        dropout=0.2,
         drop_path=0.1,
     )
-    summary(model, input_size=(1, 5, 128, 64))
+    summary(model, input_size=(1, 9, 128, 64))
 
 
 if __name__ == "__main__":
