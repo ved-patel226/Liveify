@@ -37,6 +37,11 @@ except ImportError:
 matplotlib.use("Agg")
 
 
+# ─────────────────────────────────────────────────────────────
+# Model (unchanged)
+# ─────────────────────────────────────────────────────────────
+
+
 class BaseLiveifyModel(torch.nn.Module):
     def __init__(
         self,
@@ -61,33 +66,17 @@ class BaseLiveifyModel(torch.nn.Module):
 
 
 class EncodecLatentModel(BaseLiveifyModel):
-    """
-    Two-level hierarchical transformer for Encodec latents.
-
-    Level 1 (intra-slot):  Self-attention *within* each segment.
-                           Complexity: O(S · T²)   — linear in # slots.
-    Level 2 (inter-slot):  Self-attention *across* slot summaries.
-                           Complexity: O(S²)        — independent of T.
-    Final:                 Target-slot tokens cross-attend to the
-                           inter-slot representations.
-
-    Total complexity:  O(S·T² + S²).
-    """
-
     def __init__(
         self,
         latent_dim: int = 128,
         context_length: int = 4,
-        forward_context_length: int = 0,
-        d_model: int = 256,
-        num_heads: int = 8,
-        intra_layers: int = 2,
-        inter_layers: int = 4,
-        final_cross_layers: int = 2,
+        forward_context_length: int = 4,
+        d_model: int = 384,
+        num_heads: int = 6,
+        num_layers: int = 8,
         ff_mult: int = 4,
-        dropout: float = 0.1,
-        drop_path: float = 0.1,
-        num_layers: int | None = None,
+        dropout: float = 0.2,
+        drop_path: float = 0.05,
     ):
         super().__init__(
             input_fdim=latent_dim,
@@ -102,44 +91,21 @@ class EncodecLatentModel(BaseLiveifyModel):
         self.d_model = d_model
         self.num_slots = context_length + 1 + forward_context_length
 
-        # projection
         self.latent_proj = nn.Sequential(
             nn.Linear(latent_dim, d_model),
             nn.Dropout(dropout),
         )
 
-        # slot-type embedding: 0=past_live, 1=forward_studio, 2=target_studio, 3=unused
-        self.slot_type_embed = nn.Embedding(4, d_model)
+        # past=0, current=1, future=2
+        self.slot_type_embed = nn.Embedding(3, d_model)
 
-        # RoPE pos encoding for both levels (separate, since they have different sequence lengths)
-        self.intra_pos = RotaryPositionalEncoding(d_model, max_len=1024)
-        self.inter_pos = RotaryPositionalEncoding(d_model, max_len=4096)
+        self.pos_enc = RotaryPositionalEncoding(d_model, max_len=4096)
 
-        # level 1: intra-slot self-attention
-        intra_dp = torch.linspace(0, drop_path * 0.5, intra_layers).tolist()
-        self.intra_layers = nn.ModuleList(
+        dp_rates = torch.linspace(0, drop_path, num_layers).tolist()
+        self.blocks = nn.ModuleList(
             [
-                SelfAttentionBlock(d_model, num_heads, ff_mult, dropout, intra_dp[i])
-                for i in range(intra_layers)
-            ]
-        )
-
-        self.slot_pool = AttentionPool(d_model)
-
-        # level 2: inter-slot self-attention
-        inter_dp = torch.linspace(0, drop_path, inter_layers).tolist()
-        self.inter_layers = nn.ModuleList(
-            [
-                SelfAttentionBlock(d_model, num_heads, ff_mult, dropout, inter_dp[i])
-                for i in range(inter_layers)
-            ]
-        )
-
-        final_dp = torch.linspace(0, drop_path * 0.5, final_cross_layers).tolist()
-        self.final_cross = nn.ModuleList(
-            [
-                CrossAttentionBlock(d_model, num_heads, ff_mult, dropout, final_dp[i])
-                for i in range(final_cross_layers)
+                SelfAttentionBlock(d_model, num_heads, ff_mult, dropout, dp_rates[i])
+                for i in range(num_layers)
             ]
         )
 
@@ -150,92 +116,232 @@ class EncodecLatentModel(BaseLiveifyModel):
         nn.init.zeros_(self.output_proj[-1].weight)
         nn.init.zeros_(self.output_proj[-1].bias)
 
-    def _build_slot_types(
-        self, batch_size: int, S: int, device: torch.device
-    ) -> torch.Tensor:
-        """Return (B, S) int tensor: 0=past_live  1=forward_studio  2=target_studio.
-
-        Dynamically assigns types based on actual input size S,
-        not just the configured values — so it works even if S
-        doesn't exactly match context_length + forward_context_length + 1.
-        """
-        types = torch.ones(batch_size, S, dtype=torch.long, device=device)
-        types[:, -1] = 2  # last slot is always target (studio)
-
-        # everything before context_length is past (live, type 0)
+    def _build_slot_types(self, batch_size, S, device):
+        types = torch.zeros(batch_size, S, dtype=torch.long, device=device)  # 0 = past
+        types[:, -1] = 1  # last slot = target
         n_past = min(self.context_length, S - 1)
-        types[:, :n_past] = 0  # past slots = live
-        # types[:, n_past:-1] = 1 (forward slots = studio, already set above)
-
+        if S > n_past + 1:
+            types[:, n_past:-1] = 2  # future context
         return types
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, S, C, T) — S slots, C=latent_dim, T=temporal frames
-        Returns:
-            (B, C, T) — predicted latent for the target slot
-        """
+    def forward(self, x):
         B, S, C, T = x.shape
+        target_idx = self.context_length
+        tgt_raw = x[:, -1].transpose(1, 2)  # (B, T, C) — last slot is target
 
-        # raw target for residual connection
-        tgt_raw = x[:, -1].transpose(1, 2)  # (B, T, C)
+        tokens = rearrange(x, "b s c t -> b (s t) c")
+        tokens = self.latent_proj(tokens)  # (B, S*T, d_model)
 
-        # project all tokens
-        tokens = rearrange(x, "b s c t -> (b s) t c")  # (B*S, T, C)
-        tokens = self.latent_proj(tokens)  # (B*S, T, D)
+        slot_types = self._build_slot_types(B, S, x.device)  # (B, S)
+        slot_types = slot_types.unsqueeze(-1).expand(-1, -1, T)  # (B, S, T)
+        slot_types = rearrange(slot_types, "b s t -> b (s t)")  # (B, S*T)
+        tokens = tokens + self.slot_type_embed(slot_types)
 
-        # level 1: intra-slot self-attention  O(S · T²)
-        tokens = self.intra_pos(tokens)
-        for layer in self.intra_layers:
-            tokens = layer(tokens)  # (B*S, T, D)
+        tokens = self.pos_enc(tokens)
 
-        all_tokens = rearrange(tokens, "(b s) t d -> b s t d", b=B)
-        tgt_tokens = all_tokens[:, -1]  # (B, T, D)
+        for block in self.blocks:
+            tokens = block(tokens)
 
-        # slot pooling: (B*S, T, D) → (B, S, D)
-        slot_summaries = self.slot_pool(tokens)  # (B*S, D)
-        slot_summaries = rearrange(slot_summaries, "(b s) d -> b s d", b=B)
-
-        # slot-type embeddings
-        slot_types = self._build_slot_types(B, S, x.device)
-        slot_summaries = slot_summaries + self.slot_type_embed(slot_types)
-
-        # level 2: inter-slot self-attention  O(S²)
-        slot_summaries = self.inter_pos(slot_summaries)
-        for layer in self.inter_layers:
-            slot_summaries = layer(slot_summaries)  # (B, S, D)
-
-        # tokens cross-attend to slot context
-        for layer in self.final_cross:
-            tgt_tokens = layer(tgt_tokens, slot_summaries)  # (B, T, D)
-
+        tgt_tokens = tokens[:, -T:]  # (B, T, d_model)
         delta = self.output_proj(tgt_tokens)  # (B, T, C)
         out = tgt_raw + delta
         return out.clamp(-10.0, 10.0).transpose(1, 2)  # (B, C, T)
+
+    def generate_autoregressive(
+        self,
+        studio_context: torch.Tensor,  # (B, ctx_len, C, T)
+        n_steps: int,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        decode_strategy: str = "sample",  # "sample", "argmax", "deterministic"
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Autoregressive generation using model's own outputs as future context.
+
+        Args:
+            studio_context: Initial studio latents (B, context_length, C, T)
+            n_steps: Number of future steps to generate
+            temperature: Sampling temperature (higher = more diverse)
+            top_k: Top-k filtering
+            top_p: Nucleus sampling threshold
+            decode_strategy: "sample", "argmax", or "deterministic"
+
+        Returns:
+            all_outputs: All generated tokens (B, n_steps, C, T)
+            all_hidden: Hidden states at each step for potential inspection
+        """
+        B, ctx_len, C, T = studio_context.shape
+        device = studio_context.device
+
+        # Build initial context: studio past + predicted future
+        # Shape: (B, total_slots, C, T) where total_slots = ctx_len + n_steps
+        total_slots = ctx_len + n_steps
+
+        # Initialize with studio context
+        context = torch.zeros(B, total_slots, C, T, device=device)
+        context[:, :ctx_len] = studio_context
+
+        all_outputs = []
+
+        with torch.no_grad():  # Generation doesn't need gradients
+            for step in range(n_steps):
+                # Current slot to predict (1-indexed into future)
+                current_slot = ctx_len + step
+
+                # Build slot types for current context
+                slot_types = self._build_slot_types(
+                    B, total_slots, device, generation_mode=True
+                )
+
+                # Run forward pass with partial context
+                output = self._forward_partial(context, slot_types, current_slot)
+
+                # Apply decoding strategy
+                decoded = self._decode_step(
+                    output, temperature, top_k, top_p, decode_strategy
+                )
+
+                # Store output
+                all_outputs.append(decoded)
+
+                # Feed prediction back into context for next step
+                context[:, current_slot] = decoded
+
+        # Stack all outputs: (B, n_steps, C, T)
+        all_outputs = torch.stack(all_outputs, dim=1)
+
+        return all_outputs
+
+    def _forward_partial(
+        self,
+        context: torch.Tensor,
+        slot_types: torch.Tensor,
+        target_slot: int,
+    ) -> torch.Tensor:
+        """Forward pass with partial context, predicting only target_slot."""
+        B, S, C, T = context.shape
+
+        # Extract tokens for all slots
+        tokens = rearrange(context, "b s c t -> (b s) t c")
+        tokens = self.latent_proj(tokens)
+
+        # Apply intra-slot attention with positional encoding
+        tokens = self.intra_pos(tokens)
+        for layer in self.intra_layers:
+            tokens = layer(tokens)
+
+        # Reorganize and pool slots
+        all_tokens = rearrange(tokens, "(b s) t d -> b s t d", b=B)
+
+        # Get slot summaries with type embeddings
+        slot_summaries = self.slot_pool(tokens)
+        slot_summaries = rearrange(slot_summaries, "(b s) d -> b s d", b=B)
+        slot_summaries = slot_summaries + self.slot_type_embed(slot_types)
+
+        # Inter-slot attention
+        slot_summaries = self.inter_pos(slot_summaries)
+        for layer in self.inter_layers:
+            slot_summaries = layer(slot_summaries)
+
+        # Get target token for final cross-attention
+        tgt_tokens = all_tokens[:, target_slot, 0]  # Take first temporal position
+
+        # Final cross-attention
+        for layer in self.final_cross:
+            tgt_tokens = layer(tgt_tokens, slot_summaries)
+
+        # Project to output space
+        delta = self.output_proj(tgt_tokens)
+
+        return delta
+
+    def _decode_step(
+        self,
+        delta: torch.Tensor,
+        temperature: float,
+        top_k: Optional[int],
+        top_p: Optional[float],
+        strategy: str,
+    ) -> torch.Tensor:
+        """Apply decoding strategy to get final output."""
+        if strategy == "argmax":
+            # Return as-is (model outputs delta, not logits)
+            return delta.clamp(-10.0, 10.0)
+
+        elif strategy == "sample":
+            if temperature != 1.0:
+                delta = delta / temperature
+
+            if top_k is not None and top_k > 0:
+                # Top-k filtering
+                top_k_vals, _ = torch.topk(delta, min(top_k, delta.shape[-1]), dim=-1)
+                threshold = top_k_vals[..., -1:]
+                delta = torch.where(
+                    delta < threshold,
+                    torch.full_like(delta, float("-inf")),
+                    delta,
+                )
+
+            if top_p is not None and top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(delta, descending=True)
+                cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+
+                sorted_mask = cum_probs > top_p
+                sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+                sorted_mask[..., 0] = False
+
+                indices_to_remove = sorted_mask.scatter(1, sorted_indices, sorted_mask)
+                delta = torch.where(
+                    indices_to_remove,
+                    torch.full_like(delta, float("-inf")),
+                    delta,
+                )
+
+            noise = torch.randn_like(delta) * (temperature * 0.1)
+            return (delta + noise).clamp(-10.0, 10.0)
+
+        else:  # deterministic
+            return delta.clamp(-10.0, 10.0)
+
+
+# ─────────────────────────────────────────────────────────────
+# Lightning module (precomputed-latent aware)
+# ─────────────────────────────────────────────────────────────
 
 
 class EncodecLatentLightningModule(pl.LightningModule):
     def __init__(
         self,
         model: EncodecLatentModel,
-        learning_rate: float = 3e-4,
+        learning_rate: float = None,
         sample_rate: int = 48000,
         encodec_bandwidth: float = 6.0,
         encodec_sample_rate: int = 24000,
         cache_dir: str = "logs/encodec_latents",
         forward_context_length: int = 0,
         context_mask_prob: float = 0.2,
+        batch_size: int = None,
+        accumulate_grad_batches: int = None,
     ):
         super().__init__()
         self.model = model
+
+        if learning_rate is None:
+            learning_rate = 3e-4 * (384 / model.d_model) ** 0.5
         self.learning_rate = learning_rate
+
+        if batch_size is None:
+            batch_size = 256 * (model.d_model // 384)
+        if accumulate_grad_batches is None:
+            accumulate_grad_batches = max(1, model.d_model // 384)
+
+        self.batch_size = batch_size
+        self.accumulate_grad_batches = accumulate_grad_batches
         self.data_sample_rate = sample_rate
         self.encodec_bandwidth = encodec_bandwidth
         self.encodec_sample_rate = encodec_sample_rate
         self.forward_context_length = forward_context_length
         self.context_mask_prob = context_mask_prob
-
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._warned_sr_mismatch = False
@@ -251,7 +357,9 @@ class EncodecLatentLightningModule(pl.LightningModule):
         self.spectral_loss = MultiScaleSTFTLoss()
         self.save_hyperparameters(ignore=["model", "encodec"])
 
-    def _augment_latents(self, x_lat: torch.Tensor) -> torch.Tensor:
+    # ─── latent-level augmentation (works on both paths) ───
+
+    def _augment_latents(self, x_lat):
         if not self.training:
             return x_lat
         B, S, C, T = x_lat.shape
@@ -265,18 +373,7 @@ class EncodecLatentLightningModule(pl.LightningModule):
 
         noise_scale = x_lat.std() * 0.02
         x_lat = x_lat + torch.randn_like(x_lat) * noise_scale
-
         return x_lat
-
-    def _mixup(self, x_lat, y_lat, alpha=0.3):
-        """Interpolate between random pairs — effectively infinite training examples."""
-        if not self.training or x_lat.size(0) < 2:
-            return x_lat, y_lat
-        lam = torch.distributions.Beta(alpha, alpha).sample().to(x_lat.device)
-        idx = torch.randperm(x_lat.size(0), device=x_lat.device)
-        x_lat = lam * x_lat + (1 - lam) * x_lat[idx]
-        y_lat = lam * y_lat + (1 - lam) * y_lat[idx]
-        return x_lat, y_lat
 
     def _encode_audio(self, audio, cache_keys=None):
         B, S, L = audio.shape
@@ -286,7 +383,6 @@ class EncodecLatentLightningModule(pl.LightningModule):
 
         if cache_keys is not None:
             for i, key in enumerate(cache_keys):
-                # ═══ FIX: include shape in hash so config changes invalidate cache ═══
                 full_key = f"{key}::S{S}::L{L}"
                 path = (
                     self.cache_dir / f"{hashlib.sha1(full_key.encode()).hexdigest()}.pt"
@@ -294,11 +390,10 @@ class EncodecLatentLightningModule(pl.LightningModule):
                 cache_paths[i] = path
                 if path.exists():
                     cached = torch.load(path, map_location=self.device)
-                    # Validate shape matches current config
                     if cached.shape[0] == S:
                         latents[i] = cached
                     else:
-                        missing_indices.append(i)  # shape mismatch → recompute
+                        missing_indices.append(i)
                 else:
                     missing_indices.append(i)
         else:
@@ -316,11 +411,9 @@ class EncodecLatentLightningModule(pl.LightningModule):
                     wav, self.data_sample_rate, self.encodec_sample_rate
                 )
 
-            # Ensure uniform audio length after resampling (resampling can cause length variations)
             max_audio_len = wav.shape[-1]
             if wav.shape[-1] < max_audio_len:
-                pad_amount = max_audio_len - wav.shape[-1]
-                wav = F.pad(wav, (0, pad_amount))
+                wav = F.pad(wav, (0, max_audio_len - wav.shape[-1]))
 
             wav = wav.to(self.device)
             wav = wav / wav.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
@@ -335,27 +428,41 @@ class EncodecLatentLightningModule(pl.LightningModule):
                 if cache_paths[si] is not None:
                     torch.save(lat_batch[idx].cpu(), cache_paths[si])
 
-        # Ensure all latents have the same temporal dimension before stacking
         if latents and any(lat is not None for lat in latents):
-            max_temporal_dim = 0
+            max_temporal_dim = max(lat.shape[-1] for lat in latents if lat is not None)
+            padded = []
             for lat in latents:
                 if lat is not None:
-                    max_temporal_dim = max(max_temporal_dim, lat.shape[-1])
-
-            if max_temporal_dim > 0:
-                padded_latents = []
-                for lat in latents:
-                    if lat is not None:
-                        # Pad the temporal dimension (last dimension)
-                        pad_amount = max_temporal_dim - lat.shape[-1]
-                        if pad_amount > 0:
-                            lat = F.pad(lat, (0, pad_amount))
-                        padded_latents.append(lat)
-                    else:
-                        padded_latents.append(lat)
-                latents = padded_latents
+                    pad_amount = max_temporal_dim - lat.shape[-1]
+                    if pad_amount > 0:
+                        lat = F.pad(lat, (0, pad_amount))
+                padded.append(lat)
+            latents = padded
 
         return torch.stack(latents).to(self.device)
+
+    def _get_latents(self, batch):
+        """Return (x_studio, x_live) regardless of whether the batch
+        contains precomputed latents or raw audio."""
+        if "studio_latents" in batch:
+            return (
+                batch["studio_latents"].to(self.device),
+                batch["live_latents"].to(self.device),
+            )
+        studio_audio = batch["studio_audio"]
+        live_audio = batch["live_audio"]
+        cache_keys = batch.get("cache_key")
+        x_studio = self._encode_audio(
+            studio_audio,
+            [f"studio::{k}" for k in cache_keys] if cache_keys else None,
+        )
+        x_live = self._encode_audio(
+            live_audio,
+            [f"live::{k}" for k in cache_keys] if cache_keys else None,
+        )
+        return x_studio, x_live
+
+    # ─── training / validation ───
 
     def forward(self, x):
         return self.model(x)
@@ -370,7 +477,6 @@ class EncodecLatentLightningModule(pl.LightningModule):
 
     def compute_loss(self, pred, target, decode_loss=False):
         pred, target = self._align_time(pred, target)
-
         l1 = F.l1_loss(pred, target)
         cos = (
             1.0
@@ -380,48 +486,39 @@ class EncodecLatentLightningModule(pl.LightningModule):
         )
         loss = l1 + 0.1 * cos
 
+        if decode_loss:
+            with torch.no_grad():
+                pred_audio = self.encodec.decoder(pred)
+                target_audio = self.encodec.decoder(target)
+            stft = self.spectral_loss(pred_audio, target_audio)
+            loss = loss + 0.1 * stft
+
         return loss
 
     def training_step(self, batch, batch_idx):
-        studio_audio, live_audio = batch["studio_audio"], batch["live_audio"]
-        cache_keys = batch.get("cache_key")
+        x_studio, x_live = self._get_latents(batch)
+        batch_size = x_studio.shape[0]
 
-        x_studio = self._encode_audio(
-            studio_audio, [f"studio::{k}" for k in cache_keys] if cache_keys else None
-        )
-        x_live = self._encode_audio(
-            live_audio, [f"live::{k}" for k in cache_keys] if cache_keys else None
-        )
-
-        # ── Build mixed input: past=LIVE, forward+target=STUDIO ──
         ctx_len = self.model.context_length
         mixed = x_studio.clone()
-        mixed[:, :ctx_len] = x_live[:, :ctx_len]  # past context uses live audio
+        mixed[:, :ctx_len] = x_live[:, :ctx_len]
 
         mixed = self._augment_latents(mixed)
 
         target = x_live[:, -1]
         y_pred = self(mixed)
 
-        # decode every 2 steps to save VRAM
-        decode_loss = self.global_step % 2 == 0
-        loss = self.compute_loss(y_pred, target, decode_loss=decode_loss)
+        loss = self.compute_loss(y_pred, target, decode_loss=True)
 
-        self.log("train/loss", loss, prog_bar=True)
-        return loss
+        scaled_loss = loss / self.accumulate_grad_batches
+
+        self.log("train/loss", loss, prog_bar=True, batch_size=batch_size)
+        return scaled_loss
 
     def validation_step(self, batch, batch_idx):
-        studio_audio, live_audio = batch["studio_audio"], batch["live_audio"]
-        cache_keys = batch.get("cache_key")
+        x_studio, x_live = self._get_latents(batch)
+        batch_size = x_studio.shape[0]
 
-        x_studio = self._encode_audio(
-            studio_audio, [f"studio::{k}" for k in cache_keys] if cache_keys else None
-        )
-        x_live = self._encode_audio(
-            live_audio, [f"live::{k}" for k in cache_keys] if cache_keys else None
-        )
-
-        # Same mixed input strategy
         ctx_len = self.model.context_length
         mixed = x_studio.clone()
         mixed[:, :ctx_len] = x_live[:, :ctx_len]
@@ -429,12 +526,11 @@ class EncodecLatentLightningModule(pl.LightningModule):
         y_pred = self(mixed)
         target = x_live[:, -1]
 
-        # ALWAYS decode on val so metric is meaningful
         loss = self.compute_loss(y_pred, target, decode_loss=True)
         trivial = self.compute_loss(x_studio[:, -1], target, decode_loss=False)
 
-        self.log("val/loss", loss, prog_bar=True)
-        self.log("val/trivial_baseline", trivial)
+        self.log("val/loss", loss, prog_bar=True, batch_size=batch_size)
+        self.log("val/trivial_baseline", trivial, batch_size=batch_size)
 
         if not self._val_preview_logged:
             self._val_preview_logged = True
@@ -443,7 +539,6 @@ class EncodecLatentLightningModule(pl.LightningModule):
         return loss
 
     def _log_audio_preview(self, pred, target):
-        """Decode and log actual audio so you can HEAR the quality."""
         if pred.numel() == 0:
             return
         with torch.no_grad():
@@ -474,7 +569,8 @@ class EncodecLatentLightningModule(pl.LightningModule):
     def _log_latent_preview(self, pred, target):
         if pred.numel() == 0:
             return
-        p, t = pred[0].cpu().float().mean(0), target[0].cpu().float().mean(0)
+        p = pred[0].cpu().float().mean(0)
+        t = target[0].cpu().float().mean(0)
         fig, ax = plt.subplots(figsize=(8, 3))
         ax.plot(p.numpy(), label="pred", alpha=0.8)
         ax.plot(t.numpy(), label="target", alpha=0.8)
@@ -510,9 +606,11 @@ class EncodecLatentLightningModule(pl.LightningModule):
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="min",
-            factor=0.5,
-            patience=150,
+            factor=0.7,  # 0.5 → 0.7 (gentler reduction)
+            patience=150,  # 150 → 50 (faster response)
+            min_lr=1e-7,  # don't go below this
         )
+
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -523,22 +621,126 @@ class EncodecLatentLightningModule(pl.LightningModule):
             },
         }
 
+    @torch.no_grad()
+    def generate(
+        self,
+        studio_audio: Optional[torch.Tensor] = None,
+        studio_latents: Optional[torch.Tensor] = None,
+        n_steps: int = 24,
+        temperature: float = 1.0,
+        decode_strategy: str = "sample",
+        initial_live_context: Optional[torch.Tensor] = None,
+        return_audio: bool = True,
+    ) -> dict:
+        """Generate live audio from studio audio autoregressively.
+
+        Args:
+            studio_audio: Raw studio audio (B, L) - will be encoded if provided
+            studio_latents: Pre-encoded studio latents (B, S, C, T)
+            n_steps: Number of steps to generate
+            temperature: Sampling temperature
+            decode_strategy: "sample", "argmax", or "deterministic"
+            initial_live_context: Optional initial live context (for continuation)
+            return_audio: Whether to decode latents to audio
+
+        Returns:
+            Dictionary with generated latents and optionally audio
+        """
+        self.model.eval()
+
+        if studio_latents is not None:
+            x_studio = studio_latents.to(self.device)
+        elif studio_audio is not None:
+            x_studio = self._encode_audio(studio_audio.to(self.device))[0]
+        else:
+            raise ValueError("Must provide either studio_audio or studio_latents")
+
+        B, S, C, T = x_studio.shape
+
+        if initial_live_context is not None:
+            init_context = initial_live_context.to(self.device)
+            ctx_len = init_context.shape[1]
+            context = torch.cat([init_context, x_studio[:, :n_steps]], dim=1)
+        else:
+            ctx_len = self.model.context_length
+            context = x_studio[:, :ctx_len]
+
+        generated_latents = self.model.generate_autoregressive(
+            studio_context=context,
+            n_steps=n_steps,
+            temperature=temperature,
+            decode_strategy=decode_strategy,
+        )
+
+        result = {
+            "generated_latents": generated_latents,
+            "studio_context": context,
+        }
+
+        if return_audio:
+            all_latents = torch.cat([context, generated_latents], dim=1)
+            flat_latents = rearrange(all_latents, "b s c t -> (b s) c t")
+
+            with torch.no_grad():
+                audio = self.encodec.decoder(flat_latents.float())
+
+            audio = rearrange(audio, "(b s) c t -> b s c t", b=B)
+            result["generated_audio"] = audio[:, ctx_len:]
+            result["full_audio"] = audio
+
+        return result
+
+    @torch.no_grad()
+    def generate_streaming(
+        self,
+        studio_chunk: torch.Tensor,
+        generated_cache: List[torch.Tensor],
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """Streaming generation - add one step at a time.
+        Useful for real-time applications.
+
+        Args:
+            studio_chunk: New studio chunk (B, C, T)
+            generated_cache: List of previously generated latents
+            temperature: Sampling temperature
+
+        Returns:
+            Next generated latent (B, C, T)
+        """
+        self.model.eval()
+
+        ctx_len = self.model.context_length
+        cache_len = len(generated_cache)
+
+        if cache_len < ctx_len:
+            return torch.zeros_like(studio_chunk)
+
+        context = torch.stack(generated_cache[-ctx_len:] + [studio_chunk], dim=1)
+
+        generated = self.model.generate_autoregressive(
+            studio_context=context,
+            n_steps=1,
+            temperature=temperature,
+        )
+
+        return generated[:, 0]
+
 
 def main():
     from torchinfo import summary
 
     model = EncodecLatentModel(
         latent_dim=128,
-        context_length=12,
-        forward_context_length=12,
-        d_model=128,
-        num_heads=4,
-        num_layers=2,
-        ff_mult=2,
+        d_model=512,
+        num_heads=8,
+        num_layers=10,
+        ff_mult=4,
         dropout=0.2,
-        drop_path=0.1,
+        drop_path=0.05,
     )
-    summary(model, input_size=(1, 9, 128, 64))
+
+    summary(model, input_size=(1, 9, 128, 16))
 
 
 if __name__ == "__main__":

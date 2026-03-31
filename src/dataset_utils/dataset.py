@@ -1,4 +1,5 @@
 import os
+import copy
 import torch
 import numpy as np
 import librosa
@@ -6,39 +7,36 @@ from torch.utils.data import Dataset, DataLoader
 from typing import Optional, Tuple, List
 import pytorch_lightning as pl
 from tqdm import tqdm
-import whisper
 import re
 from difflib import SequenceMatcher
-import pickle
-import hashlib
+from multiprocessing import Pool
 
 
+# ─────────────────────────────────────────────────────────────
+# DTW alignment worker (must be top-level for pickling)
+# ─────────────────────────────────────────────────────────────
 def _align_pair_worker(args):
-    """Module-level function for multiprocessing (must be pickleable)."""
     paths, pair_data, sr = args
     hop_length = 512
-
     studio_audio = pair_data["studio_audio"]
     live_audio = pair_data["live_audio"]
-
-    # + 1e-9 to avoid DTW bitching
     studio_chroma = (
         librosa.feature.chroma_cqt(y=studio_audio, sr=sr, hop_length=hop_length) + 1e-9
     )
     live_chroma = (
         librosa.feature.chroma_cqt(y=live_audio, sr=sr, hop_length=hop_length) + 1e-9
     )
-
     _, wp = librosa.sequence.dtw(X=live_chroma, Y=studio_chroma, metric="cosine")
-
     studio_start_frame = wp[-1, 1]
     studio_start_sample = studio_start_frame * hop_length
     end_sample = studio_start_sample + len(live_audio)
     cropped_studio = studio_audio[studio_start_sample:end_sample]
-
     return paths, cropped_studio
 
 
+# ─────────────────────────────────────────────────────────────
+# Original audio dataset (unchanged)
+# ─────────────────────────────────────────────────────────────
 class StudioLiveDataset(Dataset):
     version = "0.2.0"
 
@@ -54,12 +52,6 @@ class StudioLiveDataset(Dataset):
         sr=22050,
         segment_overlap=0.875,
     ):
-        """Dataset pairs `studio`/`live` audio files.
-
-        Args:
-            context_length: Number of past frames (before target)
-            forward_context_length: Number of future frames from studio only (after target)
-        """
         self.studio_dir = studio_dir
         self.live_dir = live_dir
         self.segment_duration = segment_duration
@@ -70,12 +62,10 @@ class StudioLiveDataset(Dataset):
         self.forward_context_length = forward_context_length
         self.sr = sr
         self.segment_overlap = segment_overlap
-        self.training = False  # Set to True during training for augmentation
+        self.training = False
 
         self.segment_hop = int(self.segment_samples * (1.0 - segment_overlap))
-        self.segment_hop = max(self.segment_hop, 1)  # safety
-
-        self.has_gpu = torch.cuda.is_available()
+        self.segment_hop = max(self.segment_hop, 1)
 
         studio_files = sorted(os.listdir(self.studio_dir))
         live_files = sorted(os.listdir(self.live_dir))
@@ -92,9 +82,6 @@ class StudioLiveDataset(Dataset):
             print(f"Warning: Studio files with no pairs: {list(unmatched_studio)}")
         if unmatched_live:
             print(f"Warning: Live files with no pairs: {list(unmatched_live)}")
-
-        # cache a flag so repeated setup calls (Lightning can call twice) do not re-align
-        self._has_setup = False
 
         self.pairs_cache = {}
         self._get_local_cache_audio()
@@ -120,92 +107,41 @@ class StudioLiveDataset(Dataset):
                 }
             except Exception as e:
                 print(f"Error loading {studio_path} or {live_path}: {e}")
-                continue
 
     def _align_cache_audio(self):
-        """Align audio pairs using DTW. Can be parallelized for faster initialization."""
-        from multiprocessing import Pool
-
         items = [
             (paths, pair_data, self.sr) for paths, pair_data in self.pairs_cache.items()
         ]
-
-        # use 4 processes for DTW alignment (faster than serial)
-        with Pool(processes=4) as pool:
+        with Pool(processes=10) as pool:
             results = pool.imap_unordered(_align_pair_worker, items, chunksize=1)
             for paths, aligned_studio in tqdm(
                 results, total=len(items), desc="Aligning audio pairs"
             ):
                 self.pairs_cache[paths]["studio_audio"] = aligned_studio
 
-    def _align_audio(self, studio_audio, live_audio, **kwargs):
-        """Crop studio_audio to match live_audio using DTW on chroma features.
-        No padding; returns cropped studio and original live audio.
-        """
-        hop_length = 512  # TODO: make this a parameter
-
-        studio_chroma = librosa.feature.chroma_cqt(
-            y=studio_audio, sr=self.sr, hop_length=hop_length
-        )
-        live_chroma = librosa.feature.chroma_cqt(
-            y=live_audio, sr=self.sr, hop_length=hop_length
-        )
-
-        # dtw distance and path
-        _, wp = librosa.sequence.dtw(X=live_chroma, Y=studio_chroma, metric="cosine")
-
-        studio_start_frame = wp[-1, 1]
-        studio_start_sample = studio_start_frame * hop_length
-        end_sample = studio_start_sample + len(live_audio)
-        cropped_studio = studio_audio[studio_start_sample:end_sample]
-
-        return cropped_studio, live_audio
-
-    def _calculate_text_similarity(self, text1, text2):
-        if not text1 and not text2:
-            return 1.0
-        if not text1 or not text2:
-            return 0.0
-        return SequenceMatcher(None, text1, text2).ratio()
-
     def _generate_augmentation_params(self):
-        """Generate random augmentation parameters for a single segment.
-        Returns same params to apply to both studio and live for alignment.
-        """
         if not self.training:
             return {"pitch_steps": 0, "time_rate": 1.0}
-
         pitch_steps = 0
         if np.random.rand() < 0.5:
             pitch_steps = np.random.uniform(-2, 2)
-
         time_rate = 1.0
         if np.random.rand() < 0.5:
             time_rate = np.random.uniform(0.95, 1.05)
-
         return {"pitch_steps": pitch_steps, "time_rate": time_rate}
 
-    def _apply_augmentation(self, audio: np.ndarray, params: dict) -> np.ndarray:
-        """Apply audio augmentation with specific parameters.
-        Pitch shift and time stretch preserve alignment when same params used.
-        """
+    def _apply_augmentation(self, audio, params):
         pitch_steps = params["pitch_steps"]
         time_rate = params["time_rate"]
-
-        # Pitch shift ±2 semitones (changes timbre without breaking alignment)
         if pitch_steps != 0:
             audio = librosa.effects.pitch_shift(audio, sr=self.sr, n_steps=pitch_steps)
-
-        # Speed change ±5% (subtle, preserves musical content)
         if time_rate != 1.0:
             audio = librosa.effects.time_stretch(audio, rate=time_rate)
-            # Truncate or pad back to original length
             target_len = self.segment_samples
             if len(audio) > target_len:
                 audio = audio[:target_len]
             else:
                 audio = np.pad(audio, (0, target_len - len(audio)))
-
         return audio
 
     def __len__(self):
@@ -225,12 +161,11 @@ class StudioLiveDataset(Dataset):
         target_start = seg_idx * self.segment_hop
 
         for i in range(self.context_length):
-            slot_idx = i
             s = target_start - (self.context_length - i) * self.segment_hop
             e = s + self.segment_samples
             if s >= 0 and e <= len(audio_dict["studio_audio"]):
-                studio_out[slot_idx] = audio_dict["studio_audio"][s:e]
-                live_out[slot_idx] = audio_dict["live_audio"][s:e]
+                studio_out[i] = audio_dict["studio_audio"][s:e]
+                live_out[i] = audio_dict["live_audio"][s:e]
 
         for fw in range(self.forward_context_length):
             slot_idx = self.context_length + fw
@@ -267,6 +202,81 @@ class StudioLiveDataset(Dataset):
         }
 
 
+# ─────────────────────────────────────────────────────────────
+# NEW: Precomputed-latent dataset
+# ─────────────────────────────────────────────────────────────
+class PrecomputedLatentDataset(Dataset):
+    """Returns precomputed Encodec latent vectors.
+
+    Each song's audio was pre-encoded on a regular hop grid:
+        grid position g  ↔  audio[g·hop : g·hop + seg_samples]
+
+    __getitem__ assembles context / forward-context / target slots by
+    indexing into these grids — identical slot logic to StudioLiveDataset,
+    but zero encoder cost.
+    """
+
+    def __init__(
+        self,
+        pairs: list,
+        studio_grids: list,  # [song_i] → Tensor(n_grid_i, C, T_latent)
+        live_grids: list,
+        context_length: int,
+        forward_context_length: int,
+        segments_per_song: int,
+    ):
+        self.pairs = pairs
+        self.studio_grids = studio_grids
+        self.live_grids = live_grids
+        self.context_length = context_length
+        self.forward_context_length = forward_context_length
+        self._segments_per_song = segments_per_song
+
+    def __len__(self):
+        return len(self.pairs) * self._segments_per_song
+
+    def __getitem__(self, idx):
+        song_idx = idx // self._segments_per_song
+        seg_idx = idx % self._segments_per_song
+
+        total_slots = self.context_length + self.forward_context_length + 1
+        sg = self.studio_grids[song_idx]  # (n_grid, C, T)
+        lg = self.live_grids[song_idx]
+        n_grid, C, T = sg.shape
+
+        s_out = sg.new_zeros(total_slots, C, T)
+        l_out = lg.new_zeros(total_slots, C, T)
+
+        tgt = seg_idx  # target's grid index
+
+        # ── past context (both studio & live) ──
+        for i in range(self.context_length):
+            gp = tgt - (self.context_length - i)
+            if 0 <= gp < n_grid:
+                s_out[i] = sg[gp]
+                l_out[i] = lg[gp]
+
+        # ── forward context (studio only — live stays zero) ──
+        for fw in range(self.forward_context_length):
+            gp = tgt + fw + 1
+            if 0 <= gp < n_grid:
+                s_out[self.context_length + fw] = sg[gp]
+
+        # ── target slot (last) ──
+        if 0 <= tgt < n_grid:
+            s_out[-1] = sg[tgt]
+            l_out[-1] = lg[tgt]
+
+        return {
+            "studio_latents": s_out,
+            "live_latents": l_out,
+            "cache_key": f"{self.pairs[song_idx][1]}::seg{seg_idx}",
+        }
+
+
+# ─────────────────────────────────────────────────────────────
+# DataModule (with precomputation support)
+# ─────────────────────────────────────────────────────────────
 class StudioLiveDataModule(pl.LightningDataModule):
     def __init__(
         self,
@@ -297,12 +307,12 @@ class StudioLiveDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.segment_overlap = dataset_kwargs.pop("segment_overlap", 0.75)
         self.dataset_kwargs = dataset_kwargs
+        self._has_setup = False
 
     def setup(self, stage=None):
-        if getattr(self, "_has_setup", False):
+        if self._has_setup:
             return
 
-        # Create TWO separate dataset instances
         common_kwargs = dict(
             studio_dir=self.studio_dir,
             live_dir=self.live_dir,
@@ -333,10 +343,7 @@ class StudioLiveDataModule(pl.LightningDataModule):
             if (i // full_dataset._segments_per_song) not in train_song_indices
         ]
 
-        # Separate datasets so .training flag is independent
-        import copy
-
-        train_ds = copy.copy(full_dataset)  # shallow copy shares the audio cache
+        train_ds = copy.copy(full_dataset)
         train_ds.training = True
         val_ds = copy.copy(full_dataset)
         val_ds.training = False
@@ -345,10 +352,140 @@ class StudioLiveDataModule(pl.LightningDataModule):
         self.val_dataset = torch.utils.data.Subset(val_ds, val_indices)
 
         print(
-            f"Split: {n_train_songs}/{n_songs} songs → {len(train_indices)} train, {len(val_indices)} val"
+            f"Split: {n_train_songs}/{n_songs} songs → "
+            f"{len(train_indices)} train, {len(val_indices)} val"
         )
         self._has_setup = True
 
+    # ─────────────────────────────────────────────────────────
+    # NEW: one-shot Encodec precomputation
+    # ─────────────────────────────────────────────────────────
+    def precompute_encodec_latents(
+        self,
+        encodec_model,
+        encodec_sr: int = 24000,
+        device: str = "cuda",
+        encode_batch_size: int = 256,
+    ):
+        """Encode every hop-grid segment with Encodec **once**, then swap
+        the audio-returning datasets for lightweight latent-returning ones.
+
+        After this call the DataLoaders yield dicts with keys
+        ``studio_latents`` / ``live_latents`` of shape ``(S, C, T)``
+        instead of raw waveforms.
+        """
+        import torchaudio  # local import — only needed here
+
+        assert self._has_setup, "call .setup() before .precompute_encodec_latents()"
+
+        base_ds: StudioLiveDataset = self.train_dataset.dataset
+
+        encodec_model = encodec_model.to(device)
+        encodec_model.eval()
+
+        studio_grids: list[torch.Tensor] = []
+        live_grids: list[torch.Tensor] = []
+
+        for sp, lp in tqdm(base_ds.pairs, desc="Pre-encoding with Encodec"):
+            ad = base_ds.pairs_cache[(sp, lp)]
+
+            sg = self._encode_audio_grid(
+                ad["studio_audio"],
+                base_ds.segment_samples,
+                base_ds.segment_hop,
+                encodec_model,
+                encodec_sr,
+                device,
+                encode_batch_size,
+            )
+            lg = self._encode_audio_grid(
+                ad["live_audio"],
+                base_ds.segment_samples,
+                base_ds.segment_hop,
+                encodec_model,
+                encodec_sr,
+                device,
+                encode_batch_size,
+            )
+
+            # studio/live can differ by a frame after alignment
+            min_g = min(sg.shape[0], lg.shape[0])
+            studio_grids.append(sg[:min_g])
+            live_grids.append(lg[:min_g])
+
+        base_ds.pairs_cache = {}
+
+        lat_ds = PrecomputedLatentDataset(
+            pairs=base_ds.pairs,
+            studio_grids=studio_grids,
+            live_grids=live_grids,
+            context_length=base_ds.context_length,
+            forward_context_length=base_ds.forward_context_length,
+            segments_per_song=base_ds._segments_per_song,
+        )
+
+        train_idx = self.train_dataset.indices
+        val_idx = self.val_dataset.indices
+        self.train_dataset = torch.utils.data.Subset(lat_ds, train_idx)
+        self.val_dataset = torch.utils.data.Subset(lat_ds, val_idx)
+
+        total_gb = (
+            sum(g.nelement() * g.element_size() for g in studio_grids + live_grids)
+            / 1e9
+        )
+        print(
+            f"✓ Precomputed latents for {len(studio_grids)} songs  |  "
+            f"RAM ≈ {total_gb:.2f} GB  |  "
+            f"grid sizes {[g.shape[0] for g in studio_grids]}"
+        )
+
+    def _encode_audio_grid(
+        self,
+        audio: np.ndarray,
+        segment_samples: int,
+        segment_hop: int,
+        encodec_model,
+        encodec_sr: int,
+        device: str,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """Encode a full song on its hop grid → ``(n_grid, C, T_latent)``."""
+        import torchaudio
+
+        n_grid = max(1, (len(audio) - segment_samples) // segment_hop + 1)
+
+        segments: list[np.ndarray] = []
+        for g in range(n_grid):
+            s = g * segment_hop
+            e = s + segment_samples
+            if e <= len(audio):
+                segments.append(audio[s:e])
+            else:
+                seg = np.zeros(segment_samples, dtype=audio.dtype)
+                seg[: len(audio) - s] = audio[s:]
+                segments.append(seg)
+
+        all_lats: list[torch.Tensor] = []
+        for i in range(0, len(segments), batch_size):
+            chunk = np.stack(segments[i : i + batch_size])
+            wav = torch.from_numpy(chunk).float().unsqueeze(1)  # (B, 1, L)
+
+            if self.sr != encodec_sr:
+                wav = torchaudio.functional.resample(wav, self.sr, encodec_sr)
+
+            wav = wav / wav.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+            wav = wav.to(device)
+
+            with torch.no_grad():
+                lat = encodec_model.encoder(wav)  # (B, C, T)
+
+            all_lats.append(lat.cpu())
+
+        return torch.cat(all_lats, dim=0)  # (n_grid, C, T)
+
+    # ─────────────────────────────────────────────────────────
+    # DataLoaders (unchanged)
+    # ─────────────────────────────────────────────────────────
     def train_dataloader(self) -> DataLoader:
         effective_workers = (
             min(self.num_workers, 2)
@@ -370,23 +507,6 @@ class StudioLiveDataModule(pl.LightningDataModule):
             self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=0,  # No shuffling in val, so no workers needed
+            num_workers=0,
             pin_memory=True,
         )
-
-
-if __name__ == "__main__":
-    dataset = StudioLiveDataset(
-        studio_dir="./dataset/studio",
-        live_dir="./dataset/live",
-        sr=22050,
-        segment_duration=0.5,
-        context_length=16,
-    )
-
-    print(f"Dataset size: {len(dataset)}")
-
-    if len(dataset) > 0:
-        x, y = dataset[0]
-        print(f"Studio (x): {x.shape}")
-        print(f"Live (y): {y.shape}")
