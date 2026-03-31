@@ -12,9 +12,8 @@ from difflib import SequenceMatcher
 from multiprocessing import Pool
 
 
-# ─────────────────────────────────────────────────────────────
-# DTW alignment worker (must be top-level for pickling)
-# ─────────────────────────────────────────────────────────────
+# dtw distance aligner
+# * don't assume it'l align correctly
 def _align_pair_worker(args):
     paths, pair_data, sr = args
     hop_length = 512
@@ -34,9 +33,6 @@ def _align_pair_worker(args):
     return paths, cropped_studio
 
 
-# ─────────────────────────────────────────────────────────────
-# Original audio dataset (unchanged)
-# ─────────────────────────────────────────────────────────────
 class StudioLiveDataset(Dataset):
     version = "0.2.0"
 
@@ -202,9 +198,6 @@ class StudioLiveDataset(Dataset):
         }
 
 
-# ─────────────────────────────────────────────────────────────
-# NEW: Precomputed-latent dataset
-# ─────────────────────────────────────────────────────────────
 class PrecomputedLatentDataset(Dataset):
     """Returns precomputed Encodec latent vectors.
 
@@ -219,7 +212,7 @@ class PrecomputedLatentDataset(Dataset):
     def __init__(
         self,
         pairs: list,
-        studio_grids: list,  # [song_i] → Tensor(n_grid_i, C, T_latent)
+        studio_grids: list,  # [song_i] -> Tensor(n_grid_i, C, T_latent)
         live_grids: list,
         context_length: int,
         forward_context_length: int,
@@ -249,20 +242,15 @@ class PrecomputedLatentDataset(Dataset):
 
         tgt = seg_idx  # target's grid index
 
-        # ── past context (both studio & live) ──
         for i in range(self.context_length):
             gp = tgt - (self.context_length - i)
             if 0 <= gp < n_grid:
                 s_out[i] = sg[gp]
                 l_out[i] = lg[gp]
-
-        # ── forward context (studio only — live stays zero) ──
         for fw in range(self.forward_context_length):
             gp = tgt + fw + 1
             if 0 <= gp < n_grid:
                 s_out[self.context_length + fw] = sg[gp]
-
-        # ── target slot (last) ──
         if 0 <= tgt < n_grid:
             s_out[-1] = sg[tgt]
             l_out[-1] = lg[tgt]
@@ -274,9 +262,6 @@ class PrecomputedLatentDataset(Dataset):
         }
 
 
-# ─────────────────────────────────────────────────────────────
-# DataModule (with precomputation support)
-# ─────────────────────────────────────────────────────────────
 class StudioLiveDataModule(pl.LightningDataModule):
     def __init__(
         self,
@@ -357,9 +342,6 @@ class StudioLiveDataModule(pl.LightningDataModule):
         )
         self._has_setup = True
 
-    # ─────────────────────────────────────────────────────────
-    # NEW: one-shot Encodec precomputation
-    # ─────────────────────────────────────────────────────────
     def precompute_encodec_latents(
         self,
         encodec_model,
@@ -374,8 +356,6 @@ class StudioLiveDataModule(pl.LightningDataModule):
         ``studio_latents`` / ``live_latents`` of shape ``(S, C, T)``
         instead of raw waveforms.
         """
-        import torchaudio  # local import — only needed here
-
         assert self._has_setup, "call .setup() before .precompute_encodec_latents()"
 
         base_ds: StudioLiveDataset = self.train_dataset.dataset
@@ -434,7 +414,7 @@ class StudioLiveDataModule(pl.LightningDataModule):
             / 1e9
         )
         print(
-            f"✓ Precomputed latents for {len(studio_grids)} songs  |  "
+            f"Precomputed latents for {len(studio_grids)} songs  |  "
             f"RAM ≈ {total_gb:.2f} GB  |  "
             f"grid sizes {[g.shape[0] for g in studio_grids]}"
         )
@@ -483,9 +463,6 @@ class StudioLiveDataModule(pl.LightningDataModule):
 
         return torch.cat(all_lats, dim=0)  # (n_grid, C, T)
 
-    # ─────────────────────────────────────────────────────────
-    # DataLoaders (unchanged)
-    # ─────────────────────────────────────────────────────────
     def train_dataloader(self) -> DataLoader:
         effective_workers = (
             min(self.num_workers, 2)

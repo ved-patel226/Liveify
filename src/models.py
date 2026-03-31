@@ -37,11 +37,6 @@ except ImportError:
 matplotlib.use("Agg")
 
 
-# ─────────────────────────────────────────────────────────────
-# Model (unchanged)
-# ─────────────────────────────────────────────────────────────
-
-
 class BaseLiveifyModel(torch.nn.Module):
     def __init__(
         self,
@@ -127,7 +122,7 @@ class EncodecLatentModel(BaseLiveifyModel):
     def forward(self, x):
         B, S, C, T = x.shape
         target_idx = self.context_length
-        tgt_raw = x[:, -1].transpose(1, 2)  # (B, T, C) — last slot is target
+        tgt_raw = x[:, -1].transpose(1, 2)  # (B, T, C) last slot is target
 
         tokens = rearrange(x, "b s c t -> b (s t) c")
         tokens = self.latent_proj(tokens)  # (B, S*T, d_model)
@@ -173,41 +168,32 @@ class EncodecLatentModel(BaseLiveifyModel):
         B, ctx_len, C, T = studio_context.shape
         device = studio_context.device
 
-        # Build initial context: studio past + predicted future
-        # Shape: (B, total_slots, C, T) where total_slots = ctx_len + n_steps
         total_slots = ctx_len + n_steps
 
-        # Initialize with studio context
         context = torch.zeros(B, total_slots, C, T, device=device)
         context[:, :ctx_len] = studio_context
 
         all_outputs = []
 
-        with torch.no_grad():  # Generation doesn't need gradients
+        with torch.no_grad():  # dont use gradients for gen
+            # TODO: mabye benefical to allow gradients? e.g. for scheduled sampling or other gen-time strategies
             for step in range(n_steps):
-                # Current slot to predict (1-indexed into future)
                 current_slot = ctx_len + step
 
-                # Build slot types for current context
                 slot_types = self._build_slot_types(
                     B, total_slots, device, generation_mode=True
                 )
 
-                # Run forward pass with partial context
                 output = self._forward_partial(context, slot_types, current_slot)
 
-                # Apply decoding strategy
                 decoded = self._decode_step(
                     output, temperature, top_k, top_p, decode_strategy
                 )
 
-                # Store output
                 all_outputs.append(decoded)
 
-                # Feed prediction back into context for next step
                 context[:, current_slot] = decoded
 
-        # Stack all outputs: (B, n_steps, C, T)
         all_outputs = torch.stack(all_outputs, dim=1)
 
         return all_outputs
@@ -221,36 +207,29 @@ class EncodecLatentModel(BaseLiveifyModel):
         """Forward pass with partial context, predicting only target_slot."""
         B, S, C, T = context.shape
 
-        # Extract tokens for all slots
         tokens = rearrange(context, "b s c t -> (b s) t c")
         tokens = self.latent_proj(tokens)
 
-        # Apply intra-slot attention with positional encoding
+        # intra-slot attention with positional encoding
         tokens = self.intra_pos(tokens)
         for layer in self.intra_layers:
             tokens = layer(tokens)
 
-        # Reorganize and pool slots
         all_tokens = rearrange(tokens, "(b s) t d -> b s t d", b=B)
 
-        # Get slot summaries with type embeddings
         slot_summaries = self.slot_pool(tokens)
         slot_summaries = rearrange(slot_summaries, "(b s) d -> b s d", b=B)
         slot_summaries = slot_summaries + self.slot_type_embed(slot_types)
 
-        # Inter-slot attention
         slot_summaries = self.inter_pos(slot_summaries)
         for layer in self.inter_layers:
             slot_summaries = layer(slot_summaries)
 
-        # Get target token for final cross-attention
-        tgt_tokens = all_tokens[:, target_slot, 0]  # Take first temporal position
+        tgt_tokens = all_tokens[:, target_slot, 0]
 
-        # Final cross-attention
         for layer in self.final_cross:
             tgt_tokens = layer(tgt_tokens, slot_summaries)
 
-        # Project to output space
         delta = self.output_proj(tgt_tokens)
 
         return delta
@@ -265,7 +244,6 @@ class EncodecLatentModel(BaseLiveifyModel):
     ) -> torch.Tensor:
         """Apply decoding strategy to get final output."""
         if strategy == "argmax":
-            # Return as-is (model outputs delta, not logits)
             return delta.clamp(-10.0, 10.0)
 
         elif strategy == "sample":
@@ -273,7 +251,6 @@ class EncodecLatentModel(BaseLiveifyModel):
                 delta = delta / temperature
 
             if top_k is not None and top_k > 0:
-                # Top-k filtering
                 top_k_vals, _ = torch.topk(delta, min(top_k, delta.shape[-1]), dim=-1)
                 threshold = top_k_vals[..., -1:]
                 delta = torch.where(
@@ -302,11 +279,6 @@ class EncodecLatentModel(BaseLiveifyModel):
 
         else:  # deterministic
             return delta.clamp(-10.0, 10.0)
-
-
-# ─────────────────────────────────────────────────────────────
-# Lightning module (precomputed-latent aware)
-# ─────────────────────────────────────────────────────────────
 
 
 class EncodecLatentLightningModule(pl.LightningModule):

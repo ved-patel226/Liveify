@@ -132,4 +132,4 @@ if __name__ == "__main__":
             full_audio, start_time, end_time, crop_start, crop_end, output_file
         )
 
-    print(f"\n✓ Done! Songs saved to '{output_dir}/' folder.")
+    print(f"\nDone! Songs saved to '{output_dir}/' folder.")

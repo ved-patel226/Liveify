@@ -50,14 +50,12 @@ if __name__ == "__main__":
             "batch_size": {"values": [4, 8]},
             "d_model": {"values": [128, 256, 384]},
             "num_heads": {"values": [2, 4, 8]},
-            "latent_layers": {"values": [2, 3, 4]},  # ← deeper
-            "dropout": {"values": [0.1, 0.15, 0.2, 0.3]},  # ← less aggressive range
+            "latent_layers": {"values": [2, 3, 4]},
+            "dropout": {"values": [0.1, 0.15, 0.2, 0.3]},
             "ff_mult": {"values": [1, 2, 4]},
             "segment_overlap": {"values": [0.0, 0.25, 0.4, 0.5, 0.75, 0.9]},
             "context_mask_prob": {"values": [0.0, 0.1, 0.2]},
-            "decode_loss_freq": {
-                "values": [2, 4, 8]
-            },  # how often to compute audio loss
+            "decode_loss_freq": {"values": [2, 4, 8]},
         },
     }
 

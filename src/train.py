@@ -127,10 +127,8 @@ def train(args=None):
         else "Starting training..."
     )
 
-    # ── 1) load & align audio, build index splits ──
     datamodule.setup()
 
-    # ── 2) precompute ALL Encodec latents (one-time cost) ──
     print("\nPrecomputing Encodec latents (one-time cost) ...")
     _enc = EncodecModel.encodec_model_24khz()
     _enc.set_target_bandwidth(args.encodec_bandwidth)
